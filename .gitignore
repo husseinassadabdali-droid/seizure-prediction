@@ -1,0 +1,19 @@
+# Data - too large for GitHub, downloaded separately via scripts
+data/raw/
+data/processed/
+
+# Model weights - too large for GitHub
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment/secrets
+.env
+*.pem
+
+# OS
+.DS_Store
