@@ -1,12 +1,20 @@
 """
 Preprocessing pipeline for EEG seizure prediction.
-Reads raw EDF files, applies filtering, selects the 6 target channels
-(closest available proxies to Fp1/Fp2/F7/F8/T3/T4), and saves the
-processed signal for downstream use by both the TCN and MLP branches.
+Reads raw EDF files, applies filtering, and extracts a fixed set of
+6 target channels in strict, consistent order (frontal/temporal proxies).
+Missing channels are zero-padded so every output array has an identical
+shape (6, n_samples), which the TCN/MLP branches require.
+
+Note: Z-score normalization is intentionally NOT applied here. It is
+applied later in dataset.py, computed per-patient across all of that
+patient's recordings combined — not per single file — to preserve
+real inter-file baseline differences and keep the raw values available
+for future recalibration (e.g. against the dry-electrode device).
 """
 
 import mne
 import numpy as np
+import gc
 from pathlib import Path
 
 # ---- Config ----
@@ -17,7 +25,8 @@ NOTCH_FREQ = 60.0  # use 50.0 for TUH/Siena depending on recording region
 
 # CHB-MIT is recorded as pre-defined bipolar pairs. These 6 channels are
 # the closest available proxies to our target frontal/temporal positions
-# (Fp1, Fp2, F7, F8, T3=T7, T4=T8).
+# (Fp1, Fp2, F7, F8, T3=T7, T4=T8). Order here is the fixed channel order
+# used in every output array — must stay consistent across all files.
 CHBMIT_TARGET_CHANNELS = [
     "FP1-F7",  # proxy for Fp1 / F7 (left frontal-temporal)
     "FP2-F8",  # proxy for Fp2 / F8 (right frontal-temporal)
@@ -33,8 +42,10 @@ def load_and_filter(edf_path: str) -> mne.io.Raw:
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
     # Some CHB-MIT files have duplicate channel names; drop duplicates
-    raw.drop_channels([ch for ch in raw.info["ch_names"]
-                        if raw.info["ch_names"].count(ch) > 1][1::2])
+    ch_names = raw.info["ch_names"]
+    duplicates = [ch for ch in ch_names if ch_names.count(ch) > 1]
+    if duplicates:
+        raw.drop_channels(duplicates[1::2])
 
     raw.filter(l_freq=BANDPASS_LOW, h_freq=BANDPASS_HIGH,
                fir_design="firwin", verbose=False)
@@ -46,26 +57,46 @@ def load_and_filter(edf_path: str) -> mne.io.Raw:
     return raw
 
 
-def select_target_channels(raw: mne.io.Raw, target_channels: list) -> mne.io.Raw:
-    """Keep only the channels available in this recording that match
-    our target list. Warns if some target channels are missing."""
-    available = [ch for ch in target_channels if ch in raw.info["ch_names"]]
-    missing = set(target_channels) - set(available)
-    if missing:
-        print(f"  [!] Missing channels in this file: {missing}")
-    return raw.pick(available)
+def extract_fixed_channels(raw: mne.io.Raw, target_channels: list) -> np.ndarray:
+    """
+    Extract target channels by explicit name-index lookup (not raw.pick(),
+    which does not guarantee output order). Missing channels are
+    zero-padded so the output shape is always (len(target_channels), n_samples).
+    """
+    available_ch_names = raw.info["ch_names"]
+    n_samples = raw.n_times
+
+    final_data = np.zeros((len(target_channels), n_samples), dtype=np.float32)
+    missing_channels = []
+
+    for i, target_ch in enumerate(target_channels):
+        if target_ch in available_ch_names:
+            ch_idx = available_ch_names.index(target_ch)
+            final_data[i, :] = raw.get_data(picks=[ch_idx])[0].astype(np.float32)
+        else:
+            missing_channels.append(target_ch)
+            # final_data[i, :] stays zero (zero-padding)
+
+    if missing_channels:
+        print(f"  [!] Missing channels replaced with zeros: {missing_channels}")
+
+    return final_data, missing_channels
 
 
 def process_file(edf_path: Path, output_dir: Path, target_channels: list):
     print(f"Processing: {edf_path.name}")
-    raw = load_and_filter(str(edf_path))
-    raw = select_target_channels(raw, target_channels)
 
-    data = raw.get_data()  # shape: (n_channels, n_samples)
+    raw = load_and_filter(str(edf_path))
+    final_data, missing_channels = extract_fixed_channels(raw, target_channels)
 
     output_path = output_dir / f"{edf_path.stem}.npy"
-    np.save(output_path, data)
-    print(f"  -> saved {data.shape} to {output_path}")
+    np.save(output_path, final_data)
+    print(f"  -> saved {final_data.shape} to {output_path}"
+          f"{' (with zero-padded channels)' if missing_channels else ''}")
+
+    # Explicit memory cleanup -- important when looping over tens of GB
+    del raw, final_data
+    gc.collect()
 
 
 def process_directory(raw_dir: str, processed_dir: str, target_channels: list):
@@ -76,11 +107,14 @@ def process_directory(raw_dir: str, processed_dir: str, target_channels: list):
     edf_files = sorted(raw_dir.rglob("*.edf"))
     print(f"Found {len(edf_files)} EDF files in {raw_dir}")
 
+    n_missing_files = 0
     for edf_path in edf_files:
         try:
             process_file(edf_path, processed_dir, target_channels)
         except Exception as e:
             print(f"  [ERROR] Failed on {edf_path.name}: {e}")
+
+    print(f"\nDone. Processed {len(edf_files)} files from {raw_dir}.")
 
 
 if __name__ == "__main__":
