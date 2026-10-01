@@ -3,6 +3,8 @@ Preprocessing pipeline for EEG seizure prediction.
 Reads raw EDF files from multiple datasets (CHB-MIT, Siena, ...), applies
 bandpass/notch filtering, standardizes channel order per dataset, and
 handles missing channels via zero-padding (preserving raw amplitudes).
+Channel lookup is case-insensitive to handle naming inconsistencies across
+files within the same dataset (e.g. "EEG Fp2" vs "EEG FP2").
 Includes a diagnostic report for missing channels to inform future
 masking decisions.
 
@@ -27,6 +29,9 @@ DATASETS = {
     "chbmit": {
         "raw_dir": "chbmit",
         "notch_freq": 60.0,
+        # CHB-MIT is recorded as pre-defined bipolar pairs. These 6 channels
+        # are the closest available proxies to our target frontal/temporal
+        # positions (Fp1, Fp2, F7, F8, T3=T7, T4=T8).
         "target_channels": [
             "FP1-F7",
             "FP2-F8",
@@ -52,8 +57,10 @@ DATASETS = {
 
 
 def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
+    """Load an EDF file and apply bandpass + notch filtering."""
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
+    # Some files have duplicate channel names; drop duplicates
     ch_names = raw.info["ch_names"]
     duplicates = [ch for ch in ch_names if ch_names.count(ch) > 1]
     if duplicates:
@@ -71,19 +78,32 @@ def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
 
 def process_file(edf_path: Path, output_dir: Path, target_channels: list,
                   notch_freq: float) -> list:
+    """
+    Extract target channels via case-insensitive name lookup (handles
+    naming inconsistencies like "EEG Fp2" vs "EEG FP2" across files of
+    the same dataset). Missing channels are zero-padded so every output
+    array has an identical shape (len(target_channels), n_samples).
+    Returns list of missing channels for diagnostic tracking. No Z-score
+    applied -- raw filtered amplitudes are saved as-is.
+    """
     raw = load_and_filter(str(edf_path), notch_freq)
     available_ch_names = raw.info["ch_names"]
     n_samples = raw.n_times
+
+    # Case-insensitive lookup table: lowercase name -> actual channel name
+    lower_to_actual = {ch.lower(): ch for ch in available_ch_names}
 
     final_data = np.zeros((len(target_channels), n_samples), dtype=np.float32)
     missing_in_this_file = []
 
     for i, target_ch in enumerate(target_channels):
-        if target_ch in available_ch_names:
-            ch_idx = available_ch_names.index(target_ch)
+        actual_ch = lower_to_actual.get(target_ch.lower())
+        if actual_ch is not None:
+            ch_idx = available_ch_names.index(actual_ch)
             final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
         else:
             missing_in_this_file.append(target_ch)
+            # final_data[i, :] stays zero (zero-padding)
 
     output_path = output_dir / f"{edf_path.stem}.npy"
     np.save(output_path, final_data)
@@ -148,8 +168,12 @@ def process_dataset(dataset_name: str, project_root: Path, config: dict):
 
 
 if __name__ == "__main__":
+    # Dynamic paths based on this script's own location -- works regardless
+    # of the current working directory or username.
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
 
+    # Runs every dataset defined in DATASETS above. To process only one
+    # dataset, call: process_dataset("chbmit", project_root, DATASETS["chbmit"])
     for name, cfg in DATASETS.items():
         process_dataset(name, project_root, cfg)
