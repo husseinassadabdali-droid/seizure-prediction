@@ -15,6 +15,11 @@ Three noise components, matching real dry-electrode artifacts:
   3. Power-line interference -- weaker electrode contact is more
      susceptible to 50/60Hz mains coupling.
 
+Default ratios were increased from an initial conservative pass (which
+produced only ~2.5% std increase) to better approximate real dry-electrode
+SNR degradation (~8-10% std increase), based on the project's dry-electrode
+hardware design.
+
 IMPORTANT: Call apply_dry_electrode_augmentation() ONCE per training
 sample, and feed the SAME augmented array to both the TCN branch (raw
 signal) and the MLP branch (handcrafted features computed from this
@@ -26,7 +31,7 @@ copies -- and keeps branch comparisons during phased training fair.
 import numpy as np
 
 
-def add_high_freq_noise(signal: np.ndarray, noise_std_ratio: float = 0.05,
+def add_high_freq_noise(signal: np.ndarray, noise_std_ratio: float = 0.15,
                          rng: np.random.Generator = None) -> np.ndarray:
     """
     Add high-frequency Gaussian noise, scaled per-channel relative to
@@ -34,7 +39,8 @@ def add_high_freq_noise(signal: np.ndarray, noise_std_ratio: float = 0.05,
     doesn't get disproportionate noise).
 
     noise_std_ratio: noise std as a fraction of each channel's signal std.
-                      0.05 = light noise, 0.15+ = heavy noise.
+                      0.05 = light noise, 0.15 = moderate-heavy noise
+                      (current default, approximating dry-electrode SNR).
     """
     rng = rng or np.random.default_rng()
     noisy = signal.copy()
@@ -47,7 +53,7 @@ def add_high_freq_noise(signal: np.ndarray, noise_std_ratio: float = 0.05,
 
 
 def add_baseline_drift(signal: np.ndarray, fs: float,
-                        drift_amplitude_ratio: float = 0.3,
+                        drift_amplitude_ratio: float = 0.6,
                         drift_freq_range: tuple = (0.05, 0.3),
                         rng: np.random.Generator = None) -> np.ndarray:
     """
@@ -76,7 +82,7 @@ def add_baseline_drift(signal: np.ndarray, fs: float,
 
 
 def add_powerline_noise(signal: np.ndarray, fs: float, notch_freq: float = 50.0,
-                         amplitude_ratio: float = 0.08,
+                         amplitude_ratio: float = 0.18,
                          rng: np.random.Generator = None) -> np.ndarray:
     """
     Add residual power-line interference at the mains frequency (and its
@@ -110,9 +116,9 @@ def apply_dry_electrode_augmentation(
     signal: np.ndarray,
     fs: float,
     notch_freq: float = 50.0,
-    high_freq_noise_ratio: float = 0.05,
-    drift_amplitude_ratio: float = 0.3,
-    powerline_amplitude_ratio: float = 0.08,
+    high_freq_noise_ratio: float = 0.15,
+    drift_amplitude_ratio: float = 0.6,
+    powerline_amplitude_ratio: float = 0.18,
     apply_prob: float = 0.8,
     rng: np.random.Generator = None,
 ) -> np.ndarray:
