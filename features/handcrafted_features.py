@@ -2,27 +2,20 @@
 Hand-crafted feature extraction for the MLP branch of the hybrid
 TCN+MLP seizure prediction model.
 
-For each (channels, samples) window, extracts per-channel:
-  1. Band powers (Delta, Theta, Alpha, Beta) via Welch PSD
-  2. Relative band powers (domain-invariant: robust to amplitude/age
-     differences across patients and recording devices)
-  3. Band power ratios (Theta/Alpha, Theta/Beta -- classic seizure
-     biomarkers, also domain-invariant)
-  4. Spectral entropy (domain-invariant measure of signal regularity)
-  5. Hjorth parameters: Activity, Mobility, Complexity
-  6. Statistical moments: mean, std, skewness, kurtosis
+Per channel: band powers (delta/theta/alpha/beta), relative band
+powers, theta/alpha and theta/beta ratios, spectral entropy, Hjorth
+parameters, and statistical moments.
 
-All features are computed per-channel then concatenated into one flat
-vector per window. Designed to be called with the SAME (possibly
-noise-augmented) window array that the TCN branch receives, so both
-branches see identical signal content during phased training.
+NaN/Inf SAFETY: near-flat signals (zero-padded missing channels, or
+flat recording segments) make skewness/kurtosis/ratios numerically
+unstable. Flat channels skip those computations, and every feature is
+clamped to a finite value as a last line of defense.
 """
 
 import numpy as np
 from scipy.signal import welch
 from scipy.stats import skew, kurtosis
 
-# ---- Band definitions (Hz) ----
 BANDS = {
     "delta": (0.5, 4.0),
     "theta": (4.0, 8.0),
@@ -31,65 +24,53 @@ BANDS = {
 }
 
 FS = 250  # must match training/dataset.py FS
+FLAT_SIGNAL_STD_THRESHOLD = 1e-6
+
+
+def _safe(value: float) -> float:
+    """Replace NaN/Inf with 0.0."""
+    if not np.isfinite(value):
+        return 0.0
+    return float(value)
 
 
 def compute_band_powers(signal_1d: np.ndarray, fs: int = FS) -> dict:
-    """
-    Welch PSD-based absolute band power for one channel's signal.
-    Returns {"delta": p, "theta": p, "alpha": p, "beta": p}.
-    """
     freqs, psd = welch(signal_1d, fs=fs, nperseg=min(256, len(signal_1d)))
-
     powers = {}
     for band_name, (low, high) in BANDS.items():
         mask = (freqs >= low) & (freqs <= high)
-        powers[band_name] = np.trapezoid(psd[mask], freqs[mask]) if mask.any() else 0.0
+        powers[band_name] = _safe(np.trapezoid(psd[mask], freqs[mask])) if mask.any() else 0.0
     return powers
 
 
 def compute_relative_band_powers(band_powers: dict) -> dict:
-    """
-    Normalize each band's power by total power across all defined bands.
-    Domain-invariant: removes absolute-amplitude differences caused by
-    skull thickness, electrode impedance, or recording device gain.
-    """
     total = sum(band_powers.values())
-    if total <= 0:
+    if total <= 1e-10:
         return {f"rel_{k}": 0.0 for k in band_powers}
-    return {f"rel_{k}": v / total for k, v in band_powers.items()}
+    return {f"rel_{k}": _safe(v / total) for k, v in band_powers.items()}
 
 
 def compute_band_ratios(band_powers: dict) -> dict:
-    """
-    Classic seizure-related spectral ratios. Domain-invariant for the
-    same reason as relative band powers (ratio of two powers cancels
-    out absolute-amplitude differences).
-    """
-    eps = 1e-10
+    eps = 1e-6
     return {
-        "theta_alpha_ratio": band_powers["theta"] / (band_powers["alpha"] + eps),
-        "theta_beta_ratio": band_powers["theta"] / (band_powers["beta"] + eps),
+        "theta_alpha_ratio": _safe(band_powers["theta"] / (band_powers["alpha"] + eps)),
+        "theta_beta_ratio": _safe(band_powers["theta"] / (band_powers["beta"] + eps)),
     }
 
 
 def compute_spectral_entropy(signal_1d: np.ndarray, fs: int = FS) -> float:
-    """
-    Shannon entropy of the normalized power spectrum. Low entropy =
-    more regular/rhythmic signal (often seen during seizures); high
-    entropy = more complex/irregular (typical interictal activity).
-    Domain-invariant: depends on spectral SHAPE, not absolute amplitude.
-    """
     freqs, psd = welch(signal_1d, fs=fs, nperseg=min(256, len(signal_1d)))
-    psd_norm = psd / (np.sum(psd) + 1e-10)
-    psd_norm = psd_norm[psd_norm > 0]  # avoid log(0)
-    return float(-np.sum(psd_norm * np.log2(psd_norm)))
+    total = np.sum(psd)
+    if total <= 1e-10:
+        return 0.0
+    psd_norm = psd / total
+    psd_norm = psd_norm[psd_norm > 1e-12]
+    if len(psd_norm) == 0:
+        return 0.0
+    return _safe(-np.sum(psd_norm * np.log2(psd_norm)))
 
 
 def compute_hjorth_params(signal_1d: np.ndarray) -> dict:
-    """
-    Hjorth Activity, Mobility, Complexity -- measure signal power,
-    mean frequency, and change in frequency, respectively.
-    """
     first_deriv = np.diff(signal_1d)
     second_deriv = np.diff(first_deriv)
 
@@ -98,26 +79,32 @@ def compute_hjorth_params(signal_1d: np.ndarray) -> dict:
     var_d2 = np.var(second_deriv)
 
     activity = var_zero
-    mobility = np.sqrt(var_d1 / var_zero) if var_zero > 0 else 0.0
-    mobility_d1 = np.sqrt(var_d2 / var_d1) if var_d1 > 0 else 0.0
-    complexity = mobility_d1 / mobility if mobility > 0 else 0.0
+    mobility = np.sqrt(var_d1 / var_zero) if var_zero > 1e-10 else 0.0
+    mobility_d1 = np.sqrt(var_d2 / var_d1) if var_d1 > 1e-10 else 0.0
+    complexity = mobility_d1 / mobility if mobility > 1e-10 else 0.0
 
-    return {"hjorth_activity": activity, "hjorth_mobility": mobility,
-            "hjorth_complexity": complexity}
+    return {"hjorth_activity": _safe(activity), "hjorth_mobility": _safe(mobility),
+            "hjorth_complexity": _safe(complexity)}
 
 
 def compute_statistical_features(signal_1d: np.ndarray) -> dict:
-    """Basic statistical moments."""
+    std = np.std(signal_1d)
+    if std < FLAT_SIGNAL_STD_THRESHOLD:
+        return {
+            "mean": _safe(float(np.mean(signal_1d))),
+            "std": 0.0,
+            "skewness": 0.0,
+            "kurtosis": 0.0,
+        }
     return {
-        "mean": float(np.mean(signal_1d)),
-        "std": float(np.std(signal_1d)),
-        "skewness": float(skew(signal_1d)),
-        "kurtosis": float(kurtosis(signal_1d)),
+        "mean": _safe(float(np.mean(signal_1d))),
+        "std": _safe(float(std)),
+        "skewness": _safe(float(skew(signal_1d))),
+        "kurtosis": _safe(float(kurtosis(signal_1d))),
     }
 
 
 def extract_channel_features(signal_1d: np.ndarray, fs: int = FS) -> dict:
-    """All features for ONE channel's 1D signal, as a flat dict."""
     band_powers = compute_band_powers(signal_1d, fs)
     features = {}
     features.update({f"bp_{k}": v for k, v in band_powers.items()})
@@ -129,8 +116,7 @@ def extract_channel_features(signal_1d: np.ndarray, fs: int = FS) -> dict:
     return features
 
 
-# Fixed feature name order -- MUST stay consistent across every call,
-# since mlp_branch.py will consume these as a plain ordered vector.
+# Fixed feature order -- must stay consistent across training and inference.
 FEATURE_NAMES = [
     "bp_delta", "bp_theta", "bp_alpha", "bp_beta",
     "rel_delta", "rel_theta", "rel_alpha", "rel_beta",
@@ -144,10 +130,9 @@ N_FEATURES_PER_CHANNEL = len(FEATURE_NAMES)
 
 def extract_features_from_window(window: np.ndarray, fs: int = FS) -> np.ndarray:
     """
-    window: (n_channels, n_samples) array -- same window passed to the
-            TCN branch (post-normalization, optionally noise-augmented).
-    Returns: flat 1D feature vector, length = n_channels * N_FEATURES_PER_CHANNEL,
-             channel-major order (all of channel 0's features, then channel 1's, ...).
+    window: (n_channels, n_samples)
+    Returns a flat float32 vector of length n_channels * N_FEATURES_PER_CHANNEL,
+    channel-major order, guaranteed finite.
     """
     n_channels = window.shape[0]
     all_features = np.zeros(n_channels * N_FEATURES_PER_CHANNEL, dtype=np.float32)
@@ -157,11 +142,10 @@ def extract_features_from_window(window: np.ndarray, fs: int = FS) -> np.ndarray
         for i, name in enumerate(FEATURE_NAMES):
             all_features[ch * N_FEATURES_PER_CHANNEL + i] = ch_features[name]
 
-    return all_features
+    return np.nan_to_num(all_features, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 if __name__ == "__main__":
-    # Sanity check against a real processed window via SeizureDataset
     import sys
     from pathlib import Path
 
@@ -180,15 +164,13 @@ if __name__ == "__main__":
 
     ds = SeizureDataset(configs, apply_augmentation=False)
     window_tensor, label = ds[0]
-    window = window_tensor.numpy()
+    features = extract_features_from_window(window_tensor.numpy())
 
-    features = extract_features_from_window(window)
+    print(f"Feature vector length: {len(features)}")
+    print(f"All features finite: {np.all(np.isfinite(features))}")
 
-    print(f"Window shape: {window.shape}")
-    print(f"Feature vector length: {len(features)} "
-          f"(expected {window.shape[0]} channels x {N_FEATURES_PER_CHANNEL} features)")
-    print(f"Label: {label.item()}")
-    print()
-    print("First channel's features:")
-    for i, name in enumerate(FEATURE_NAMES):
-        print(f"  {name:<20} {features[i]:.6f}")
+    # Stress test: flat and zero-padded channels must NOT produce NaN/Inf
+    flat_window = np.zeros((6, 1000), dtype=np.float32)
+    flat_window[1] = 5.0  # constant non-zero channel
+    flat_features = extract_features_from_window(flat_window)
+    print(f"Flat/zero window finite: {np.all(np.isfinite(flat_features))}")

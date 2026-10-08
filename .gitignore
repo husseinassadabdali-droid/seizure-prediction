@@ -17,3 +17,7 @@ venv/
 
 # OS
 .DS_Store
+
+# Installers / archives
+*.zip
+aws/

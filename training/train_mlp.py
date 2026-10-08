@@ -14,6 +14,15 @@ Split strategy: patient-level (grouped) train/val split -- entire
 patients go to one side only, never split across train and val, to
 avoid leaking a patient's signal characteristics across the split
 (same principle LOSO-CV will apply more rigorously in evaluation/).
+
+Stability safeguards (added after a NaN-loss training collapse was
+traced to near-flat signals in handcrafted_features.py):
+  - Gradient norm clipping (max_norm=5.0) after every backward pass --
+    a second line of defense against exploding gradients from any
+    future NaN/Inf source, not just the one already fixed upstream.
+  - A batch-level NaN/Inf guard on the loss itself: if a batch somehow
+    still produces a non-finite loss, that batch's update is skipped
+    (not applied) rather than corrupting the model's weights.
 """
 
 import sys
@@ -22,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "models"))
@@ -34,6 +43,7 @@ from handcrafted_features import extract_features_from_window, N_FEATURES_PER_CH
 
 N_CLASSES = 3
 SEED = 42
+GRAD_CLIP_MAX_NORM = 5.0
 
 
 class MLPClassifier(nn.Module):
@@ -116,6 +126,10 @@ class FeatureDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         window_tensor, label = self.base_ds[self.indices[i]]
         features = extract_features_from_window(window_tensor.numpy(), fs=self.fs)
+        # Belt-and-suspenders: guarantee a finite tensor even if an
+        # unexpected edge case slips past handcrafted_features.py's
+        # own guards.
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         return torch.from_numpy(features), label
 
 
@@ -181,16 +195,32 @@ def main():
 
         model.train()
         running_loss = 0.0
+        n_samples_seen = 0
+        n_batches_skipped = 0
+
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             logits = model(x)
             loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * x.size(0)
 
-        train_loss = running_loss / len(train_ds)
+            if not torch.isfinite(loss):
+                # Skip this batch entirely rather than let a non-finite
+                # loss corrupt the model's weights via backward().
+                n_batches_skipped += 1
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+            optimizer.step()
+
+            running_loss += loss.item() * x.size(0)
+            n_samples_seen += x.size(0)
+
+        train_loss = running_loss / max(n_samples_seen, 1)
+        if n_batches_skipped > 0:
+            print(f"  [!] Skipped {n_batches_skipped} batch(es) with non-finite loss this epoch")
+
         val_acc, val_macro_recall, val_per_class_recall = evaluate(model, val_loader, device)
 
         print(f"Epoch {epoch:2d}/{n_epochs} | train_loss={train_loss:.4f} | "
