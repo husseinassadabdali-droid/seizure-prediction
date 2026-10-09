@@ -1,43 +1,30 @@
 """
 MLP branch for the hybrid TCN+MLP seizure prediction model.
 
-Consumes the flat hand-crafted feature vector (108 values: 6 channels
-x 18 features, from features/handcrafted_features.py) and projects it
-through a small dense network into a fixed-size embedding, matching
-the TCN branch's role in the fusion design.
+Consumes the flat hand-crafted feature vector (6 channels x 18 features
+= 108, from features/handcrafted_features.py) and projects it into a
+fixed-size embedding (64) for the fusion layer.
 
-Architecture: three Linear layers with BatchNorm + ReLU + Dropout,
-progressively narrowing: 108 -> 128 -> 64 -> 64 (output embedding).
-
-Input:  (batch, n_features=108) -- raw hand-crafted feature vector,
-        NOT pre-normalized by this module. Feature-level normalization
-        (e.g. per-patient Z-score) should happen upstream if needed;
-        BatchNorm here handles batch-level scale differences during
-        training.
-Output: (batch, 64) -- fixed-size embedding, fed into the fusion
-        layer alongside the TCN branch's 128-dim output.
+Input scaling lives INSIDE this module (robust center/scale buffers +
+clamp to +-FEATURE_CLIP). The buffers are part of state_dict, so the
+saved branch weights carry their own normalization statistics and the
+fusion model can load them without any extra preprocessing. Defaults
+(center=0, scale=1) make it an identity until set_feature_stats() is
+called by train_mlp.py.
 """
 
 import torch
 import torch.nn as nn
 
+FEATURE_CLIP = 10.0
+
 
 class MLPBranch(nn.Module):
     def __init__(self, n_input_features: int = 108, hidden_dim: int = 128,
                  output_dim: int = 64, dropout: float = 0.3):
-        """
-        n_input_features: length of the hand-crafted feature vector
-                           (6 channels x 18 features = 108, must match
-                           features/handcrafted_features.py exactly).
-        hidden_dim: width of the first hidden layer.
-        output_dim: final embedding size (64, per the agreed fusion
-                    design: TCN=128 + MLP=64 -> concat=192).
-        dropout: higher than the TCN branch's (0.2) since the MLP
-                 branch has proportionally more capacity relative to
-                 its small input size, and is more prone to
-                 overfitting on 108 hand-crafted numbers.
-        """
         super().__init__()
+        self.register_buffer("feature_center", torch.zeros(n_input_features))
+        self.register_buffer("feature_scale", torch.ones(n_input_features))
 
         self.net = nn.Sequential(
             nn.Linear(n_input_features, hidden_dim),
@@ -53,64 +40,39 @@ class MLPBranch(nn.Module):
             nn.Linear(output_dim, output_dim),
         )
 
+    @torch.no_grad()
+    def set_feature_stats(self, center, scale):
+        center = torch.as_tensor(center, dtype=torch.float32)
+        scale = torch.as_tensor(scale, dtype=torch.float32).clamp_min(1e-6)
+        self.feature_center.copy_(center)
+        self.feature_scale.copy_(scale)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (batch, n_input_features)
-        returns: (batch, output_dim)
-        """
+        x = ((x - self.feature_center) / self.feature_scale).clamp(-FEATURE_CLIP, FEATURE_CLIP)
         return self.net(x)
 
 
 if __name__ == "__main__":
-    batch_size, n_features = 8, 108
-
-    model = MLPBranch(n_input_features=n_features, hidden_dim=128,
-                       output_dim=64, dropout=0.3)
-
-    dummy_input = torch.randn(batch_size, n_features)
-    model.eval()  # BatchNorm needs eval mode for a clean single-batch test
+    torch.manual_seed(0)
+    model = MLPBranch(n_input_features=108)
+    model.eval()
     with torch.no_grad():
-        output = model(dummy_input)
+        out = model(torch.randn(8, 108))
+    assert out.shape == (8, 64)
+    print(f"Shape check OK: {tuple(out.shape)}, params={sum(p.numel() for p in model.parameters()):,}")
 
-    print(f"Input shape:  {dummy_input.shape}")
-    print(f"Output shape: {output.shape}")
-    assert output.shape == (batch_size, 64), "Output shape mismatch!"
-    print("Shape check: OK")
-    print()
+    # normalization buffers must travel with state_dict
+    model.set_feature_stats(torch.full((108,), 3.0), torch.full((108,), 2.0))
+    state = model.state_dict()
+    assert "feature_center" in state and "feature_scale" in state
+    fresh = MLPBranch(n_input_features=108)
+    fresh.load_state_dict(state)
+    assert torch.allclose(fresh.feature_center, torch.full((108,), 3.0))
+    print("State-dict carries normalization stats: OK")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
-    print()
-
-    # Sanity check: with a real feature vector (via handcrafted_features.py
-    # + dataset.py), confirm the full pipeline connects end-to-end.
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training"))
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "features"))
-    from dataset import SeizureDataset  # noqa: E402
-    from handcrafted_features import extract_features_from_window  # noqa: E402
-
-    project_root = Path(__file__).resolve().parent.parent
-    configs = [
-        {
-            "name": "chbmit",
-            "processed_dir": project_root / "data/processed/chbmit",
-            "raw_dir": project_root / "data/raw/chbmit",
-            "notch_freq": 60.0,
-        },
-    ]
-
-    ds = SeizureDataset(configs, apply_augmentation=False)
-    window_tensor, label = ds[0]
-    window = window_tensor.numpy()
-
-    features = extract_features_from_window(window)
-    features_tensor = torch.from_numpy(features).unsqueeze(0)  # add batch dim -> (1, 108)
-
+    # extreme inputs must stay finite thanks to the clamp
+    fresh.eval()
     with torch.no_grad():
-        real_output = model(features_tensor)
-
-    print(f"Real feature vector shape: {features_tensor.shape}")
-    print(f"Real MLP branch output shape: {real_output.shape}")
-    print(f"Label for this sample: {label.item()}")
+        out_huge = fresh(torch.full((2, 108), 1e9))
+    assert torch.isfinite(out_huge).all()
+    print("Extreme-input clamp: OK")
