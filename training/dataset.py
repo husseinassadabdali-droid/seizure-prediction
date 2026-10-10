@@ -375,6 +375,10 @@ class SeizureDataset(Dataset):
         for patient_id, files in files_by_patient.items():
             mean, std = compute_patient_stats(files)
             self.patient_stats_cache[(name, patient_id)] = (mean, std)
+            # time_sec: each patient gets its own 1e8-second block, so runs of windows
+            # never connect across patients in event-level metrics
+            patient_base = len(self.patient_stats_cache) * 1e8
+            n_within_patient = 0
 
             for npy_file in files:
                 n_samples = np.load(npy_file, mmap_mode="r").shape[1]
@@ -385,9 +389,12 @@ class SeizureDataset(Dataset):
                     windows = label_windows_for_file(
                         patient_seizures.get(timeline_pid, []), n_samples, offset_sec=offset)
                     n_timeline += 1
+                    file_time0 = patient_base + offset
                 else:
                     windows = label_windows_for_file(within_file.get(stem, []), n_samples)
                     n_within += 1
+                    n_within_patient += 1
+                    file_time0 = patient_base + 5e7 + n_within_patient * 1e5
 
                 for (start_sample, label) in windows:
                     counts[label] += 1
@@ -398,6 +405,7 @@ class SeizureDataset(Dataset):
                         "start_sample": start_sample,
                         "label": label,
                         "notch_freq": notch_freq,
+                        "time_sec": file_time0 + start_sample / FS,
                     })
 
         print(f"[{name}] windows: interictal={counts[0]:,} preictal={counts[1]:,} ictal={counts[2]:,} | "

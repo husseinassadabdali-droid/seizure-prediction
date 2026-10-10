@@ -206,8 +206,10 @@ def evaluate_full(model, ds, indices, file_ids, batch_size, num_workers, device,
     entries = [ds.index[int(i)] for i in indices]
     names = sorted({f"{e['dataset']}/{e['patient_id']}" for e in entries})
     code = {n: k for k, n in enumerate(names)}
-    times = np.array([file_ids[e["npy_path"]] * 1e7 + e["start_sample"] / FS for e in entries])
+    times = np.array([e["time_sec"] for e in entries], dtype=np.float64)
     groups = np.array([code[f"{e['dataset']}/{e['patient_id']}"] for e in entries], dtype=np.int64)
+    same_patient = groups[1:] == groups[:-1]
+    assert np.all(np.diff(times)[same_patient] >= 0), "window times must not decrease within a patient"
     return {"probs": probs, "y": y, "times": times, "groups": groups, "group_names": names}
 
 

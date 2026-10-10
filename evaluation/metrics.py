@@ -113,11 +113,14 @@ def _runs(mask, times, max_gap):
     return runs
 
 
-def event_metrics(y_true, alarm, times, step_sec: float = 2.0) -> dict:
+def event_metrics(y_true, alarm, times, step_sec: float = 2.0, max_gap_sec: float = None) -> dict:
     y_true = np.asarray(y_true)
     alarm = np.asarray(alarm, dtype=bool)
     times = np.asarray(times, dtype=float)
-    max_gap = 1.5 * step_sec
+    # Windows further apart than max_gap are non-contiguous. Default suits one continuous
+    # recording; pass ~60 when files of a patient are stitched on a clock timeline
+    # (consecutive files are a few seconds apart).
+    max_gap = float(max_gap_sec) if max_gap_sec is not None else 1.5 * step_sec
 
     n_early = n_ictal_only = n_missed = 0
     lead_times = []
