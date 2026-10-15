@@ -18,6 +18,7 @@ LOSO analysis on the cached hand-crafted features (clean features, labeling v2).
 IN MEMORY ONLY, as a power check of this whole pipeline.
 """
 import argparse
+import os
 import json
 import sys
 import time
@@ -38,7 +39,7 @@ STEP_SEC = 2.0
 CACHE = ROOT / "data/processed/feature_cache"
 ALIAS = {"chbmit/chb21": "chbmit/chb01"}     # same physical subject
 MAX_GAP = 60.0
-LATE_BAND = (0.0, 600.0)
+LATE_BAND = (float(os.environ.get("LATE_START", "0")), 600.0)   # LATE_START=120 skips the last 2 min
 EARLY_BAND = (1200.0, 1800.0)
 MIN_WIN = 100                                # windows needed in each band
 
@@ -203,7 +204,9 @@ def self_test():
     f = np.zeros(len(t), dtype=np.int64)
     s = np.linspace(0.2, 0.8, len(t))
     delta, same = band_stat(3000.0, t, y, f, s, 1)
-    assert abs(delta - 0.24) < 0.01 and same
+    # linear ramp 0.2->0.8 over 2998 s: expected delta = slope * (mean time-to-event of early band - of late band)
+    expected = 0.6 / 2998.0 * (1500.0 - 0.5 * (LATE_BAND[0] + LATE_BAND[1]))
+    assert abs(delta - expected) < 0.01 and same
     f2 = f.copy()
     f2[t >= 1750] = 1
     assert band_stat(3000.0, t, y, f2, s, 1)[1] is False
