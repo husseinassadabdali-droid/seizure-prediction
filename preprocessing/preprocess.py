@@ -15,6 +15,10 @@ Legacy/demo callers may still select per-patient normalization in dataset.py.
 import mne
 import numpy as np
 import gc
+import hashlib
+import json
+import os
+import tempfile
 from pathlib import Path
 
 # ---- Config ----
@@ -99,8 +103,55 @@ def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
     return raw
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _edf_header_sha256(path: Path) -> str:
+    with Path(path).open("rb") as handle:
+        return hashlib.sha256(handle.read(256)).hexdigest()
+
+
+def _canonical_fingerprint(value) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _processing_config_fingerprint(dataset_name: str) -> str:
+    config = DATASETS[dataset_name]
+    return _canonical_fingerprint({
+        "dataset": dataset_name, "target_sfreq": TARGET_SFREQ,
+        "bandpass_low": BANDPASS_LOW, "bandpass_high": BANDPASS_HIGH,
+        "notch_freq": config.get("notch_freq"),
+        "channel_order": list(config.get("target_channels", [])), "units": "V",
+        "preprocess_code_sha256": _sha256_file(Path(__file__).resolve()),
+        "mne_version": getattr(mne, "__version__", None), "numpy_version": np.__version__,
+    })
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def process_file(edf_path: Path, output_dir: Path, target_channels: list,
-                  notch_freq: float) -> list:
+                  notch_freq: float, dataset_name: str = None) -> list:
     """
     Extract target channels via case-insensitive exact-name lookup.
     Missing or ambiguous targets raise before an output NPY is written.
@@ -126,8 +177,41 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
     for i, ch_idx in enumerate(channel_indices):
         final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{edf_path.stem}.npy"
-    np.save(output_path, final_data)
+    fd, temp_name = tempfile.mkstemp(prefix=output_path.name + ".", suffix=".tmp", dir=output_dir)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.save(handle, final_data, allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, output_path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+    # Production dataset runs must identify the dataset so the evidence can be
+    # checked against the current channel/filter policy. Legacy utility callers
+    # may omit it, in which case no verified sidecar is issued.
+    if dataset_name is not None:
+        if dataset_name not in DATASETS:
+            raise ValueError(f"unknown dataset for processing provenance: {dataset_name}")
+        evidence = {
+            "schema_version": 1, "status": "VERIFIED",
+            "source_file": Path(edf_path).name,
+            "source_fingerprint": _edf_header_sha256(edf_path),
+            "source_size": Path(edf_path).stat().st_size,
+            "preprocessing_config_fingerprint": _processing_config_fingerprint(dataset_name),
+            "channel_order": list(target_channels), "sample_rate_hz": TARGET_SFREQ,
+            "units": "V", "dataset": dataset_name,
+            "output_file": output_path.name, "output_size": output_path.stat().st_size,
+            "output_sha256": _sha256_file(output_path),
+        }
+        _atomic_json(output_path.with_name(output_path.name + ".provenance.json"), evidence)
 
     del raw, final_data
     gc.collect()
@@ -160,7 +244,7 @@ def process_dataset(dataset_name: str, project_root: Path, config: dict):
     for edf_path in edf_files:
         try:
             print(f"Processing: {edf_path.name} ... ", end="")
-            missing = process_file(edf_path, processed_dir, target_channels, notch_freq)
+            missing = process_file(edf_path, processed_dir, target_channels, notch_freq, dataset_name=dataset_name)
 
             if missing:
                 files_with_missing_channels += 1
