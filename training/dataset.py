@@ -1029,11 +1029,38 @@ class SeizureDataset(Dataset):
                 continue
             candidates_by_patient[patient_id].append(npy_file)
 
+        # Signal integrity is an independent gate from annotation/source quality.
+        # Screen each processed NPY read-only before it can enter window indexing or
+        # normalization. Missing, malformed, non-finite, flat, or suspicious signals
+        # are withheld for review rather than silently treated as clean recordings.
+        features_dir = Path(__file__).resolve().parent.parent / "features"
+        if str(features_dir) not in sys.path:
+            sys.path.insert(0, str(features_dir))
+        from cache_provenance import inspect_signal_file  # noqa: E402
+
         for patient_id, candidates in candidates_by_patient.items():
+            signal_withheld = 0
+            for npy_file in candidates:
+                signal_report = inspect_signal_file(npy_file)
+                if signal_report.get("status") != "PASS":
+                    prior = quality_by_file.get(
+                        npy_file.stem,
+                        _quality_record(REVIEW_REQUIRED, "recording absent from trusted source inventory"))
+                    reasons = list(signal_report.get("issues", []))
+                    reason = "signal-integrity review required"
+                    if reasons:
+                        reason += ": " + "; ".join(reasons)
+                    quality_by_file[npy_file.stem] = _quality_record(
+                        REVIEW_REQUIRED, reason,
+                        training_eligible=False, event_eval_eligible=False)
+                    signal_withheld += 1
             trusted, withheld = filter_recordings_by_quality(
                 candidates, quality_by_file, stem_getter=lambda path: path.stem)
             files_by_patient[patient_id].extend(trusted)
             review_required[patient_id] += len(withheld)
+            if signal_withheld:
+                print(f"[{name}] {patient_id}: withheld {signal_withheld} recording(s) "
+                      "by signal-integrity gate")
 
         counts = np.zeros(3, dtype=np.int64)
         n_timeline = n_within = 0
