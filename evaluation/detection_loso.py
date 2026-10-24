@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT / "features"))
 
 from loso_cache_analysis import load_cache, robust_stats, transform, fit_logreg  # noqa: E402
 from metrics import roc_auc_binary, _runs  # noqa: E402
+from cache_provenance import build_dataset_provenance, write_artifact_manifest  # noqa: E402
 
 STEP_SEC = 2.0
 MAX_GAP = 60.0
@@ -219,8 +220,12 @@ def main():
     rng = np.random.default_rng(args.seed)
     for m in [x.strip() for x in args.models.split(",")]:
         scores, thr = detect_loso(X, y, grp, gnames, m, args.train_cap, args.seed)
-        np.savez_compressed(ROOT / "checkpoints" / f"detect_oof_{'_'.join(selected)}_{m}.npz",
-                            scores=scores, thr=thr, t=t, y=y)
+        out = ROOT / "checkpoints" / f"detect_oof_{'_'.join(selected)}_{m}.npz"
+        np.savez_compressed(out, scores=scores, thr=thr, t=t, y=y)
+        dataset_fp = build_dataset_provenance()["dataset_fingerprint"]
+        write_artifact_manifest(out, dataset_fp, "detection_oof",
+                                {"datasets": selected, "model": m, "seed": args.seed,
+                                 "train_cap": args.train_cap})
         report(m, scores, thr, y, t, blocks, grp, args, rng)
 
 

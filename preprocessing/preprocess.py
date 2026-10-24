@@ -8,11 +8,9 @@ files within the same dataset (e.g. "EEG Fp2" vs "EEG FP2").
 Includes a diagnostic report for missing channels to inform future
 masking decisions.
 
-Note: Z-score normalization is intentionally NOT applied here. It is applied
-later in dataset.py, computed per-patient across all of that patient's
-recordings combined -- not per single file -- to preserve real inter-file
-baseline differences and keep raw values available for future recalibration
-against the dry-electrode device.
+Note: Z-score normalization is intentionally not applied here. The MLP and TCN
+training paths fit frozen statistics from training patients after splitting.
+Legacy/demo callers may still select per-patient normalization in dataset.py.
 """
 
 import mne
@@ -56,15 +54,41 @@ DATASETS = {
 }
 
 
+def match_target_channels(available_channels: list, target_channels: list):
+    """Match exact channel labels case-insensitively; never infer substitutes.
+
+    Returns (indices, missing, ambiguous). Whitespace around EDF labels is
+    ignored. A target with duplicate matching labels is ambiguous and is not
+    selected, avoiding the old dict-overwrite/first-index behavior.
+    """
+    matches = {}
+    for index, name in enumerate(available_channels):
+        key = str(name).strip().casefold()
+        matches.setdefault(key, []).append(index)
+
+    indices, missing, ambiguous = [], [], []
+    for target in target_channels:
+        key = str(target).strip().casefold()
+        found = matches.get(key, [])
+        if len(found) == 1:
+            indices.append(found[0])
+        elif not found:
+            indices.append(None)
+            missing.append(target)
+        else:
+            indices.append(None)
+            ambiguous.append(target)
+    return indices, missing, ambiguous
+
+
 def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
     """Load an EDF file and apply bandpass + notch filtering."""
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
-    # Some files have duplicate channel names; drop duplicates
-    ch_names = raw.info["ch_names"]
-    duplicates = [ch for ch in ch_names if ch_names.count(ch) > 1]
-    if duplicates:
-        raw.drop_channels(duplicates[1::2])
+    # Do not silently drop duplicate labels. The target matcher treats an
+    # ambiguous exact label as unavailable and the quality gate reviews the
+    # resulting zero-padded channel. MNE may normalize duplicate EDF labels;
+    # the available names after reading remain the labels actually matched.
 
     raw.filter(l_freq=BANDPASS_LOW, h_freq=BANDPASS_HIGH,
                fir_design="firwin", verbose=False)
@@ -90,20 +114,17 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
     available_ch_names = raw.info["ch_names"]
     n_samples = raw.n_times
 
-    # Case-insensitive lookup table: lowercase name -> actual channel name
-    lower_to_actual = {ch.lower(): ch for ch in available_ch_names}
+    channel_indices, missing, ambiguous = match_target_channels(
+        available_ch_names, target_channels)
 
     final_data = np.zeros((len(target_channels), n_samples), dtype=np.float32)
-    missing_in_this_file = []
+    missing_in_this_file = list(missing) + [f"{name} (ambiguous duplicate label)"
+                                            for name in ambiguous]
 
-    for i, target_ch in enumerate(target_channels):
-        actual_ch = lower_to_actual.get(target_ch.lower())
-        if actual_ch is not None:
-            ch_idx = available_ch_names.index(actual_ch)
+    for i, ch_idx in enumerate(channel_indices):
+        if ch_idx is not None:
             final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
-        else:
-            missing_in_this_file.append(target_ch)
-            # final_data[i, :] stays zero (zero-padding)
+        # A missing or ambiguous target remains zero padded and is reported.
 
     output_path = output_dir / f"{edf_path.stem}.npy"
     np.save(output_path, final_data)

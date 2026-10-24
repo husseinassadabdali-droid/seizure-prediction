@@ -50,6 +50,14 @@ N_CLASSES = 3  # interictal=0, preictal=1, ictal=2
 FS = 250  # must match training/dataset.py and features/handcrafted_features.py
 
 
+def _load_validated_branch(path, artifact_kind, dataset_fingerprint, map_location):
+    """Validate branch provenance before deserializing checkpoint bytes."""
+    from cache_provenance import validate_artifact_manifest
+
+    validate_artifact_manifest(path, dataset_fingerprint, artifact_kind)
+    return torch.load(path, map_location=map_location)
+
+
 class FusionModel(nn.Module):
     def __init__(self, n_channels: int = 6, tcn_output_dim: int = 128,
                  mlp_output_dim: int = 64, fusion_dropout: float = 0.45,
@@ -111,7 +119,8 @@ class FusionModel(nn.Module):
 
     def load_pretrained_branches(self, tcn_weights_path: str = None,
                                   mlp_weights_path: str = None,
-                                  map_location: str = "cpu"):
+                                  map_location: str = "cpu",
+                                  dataset_fingerprint: str = None):
         """
         Load independently pre-trained branch weights (from
         train_tcn.py / train_mlp.py checkpoints) as initialization
@@ -119,13 +128,25 @@ class FusionModel(nn.Module):
         training strategy (Phase 1: MLP alone, Phase 2: TCN alone,
         Phase 3: load both here and train the fusion layer jointly).
         """
+        if (tcn_weights_path is not None or mlp_weights_path is not None) and not dataset_fingerprint:
+            raise ValueError("dataset_fingerprint is required to validate pretrained branch provenance")
+        from cache_provenance import (validate_artifact_manifest,
+                                      validate_matching_normalization_manifests)
+        validated = []
+        for path, kind in ((tcn_weights_path, "tcn_branch"), (mlp_weights_path, "mlp_branch")):
+            if path is not None:
+                validated.append(validate_artifact_manifest(path, dataset_fingerprint, kind))
+        if len(validated) == 2:
+            validate_matching_normalization_manifests(*validated)
         if tcn_weights_path is not None:
-            state = torch.load(tcn_weights_path, map_location=map_location)
+            state = _load_validated_branch(
+                tcn_weights_path, "tcn_branch", dataset_fingerprint, map_location)
             self.tcn_branch.load_state_dict(state)
             print(f"Loaded pretrained TCN branch weights from {tcn_weights_path}")
 
         if mlp_weights_path is not None:
-            state = torch.load(mlp_weights_path, map_location=map_location)
+            state = _load_validated_branch(
+                mlp_weights_path, "mlp_branch", dataset_fingerprint, map_location)
             self.mlp_branch.load_state_dict(state)
             print(f"Loaded pretrained MLP branch weights from {mlp_weights_path}")
 

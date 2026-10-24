@@ -14,9 +14,9 @@ Scores
 Pre-specified PRIMARY result: median per-patient detection AUC over the val+test
 patients that have ictal windows, TCN vs model. Everything else is descriptive.
 
-Event-level detection uses CROSS-calibration: the alarm threshold for the test patients
-is a quantile of the non-ictal scores of the val patients, and vice versa, so every
-window is judged with a threshold derived from other patients.
+Event-level detection uses the validation patients to calibrate the alarm threshold
+for the held-out test patients. Validation event thresholds are descriptive and use
+validation scores; test scores and labels never set a threshold.
 
 Caveats (printed again at the end)
   * The TCN checkpoint was selected on the val patients (epoch with best 3-class
@@ -41,6 +41,7 @@ from loso_cache_analysis import ALIAS, robust_stats, transform, interictal_contr
 from detection_loso import (fit_predict, alarm_block, block_result, pooled, chance,  # noqa: E402
                             MAX_GAP, QUANTILES, SMOOTH_K)
 from metrics import roc_auc_binary, _runs  # noqa: E402
+from cache_provenance import validate_cache_directory, validate_current_artifact  # noqa: E402
 
 CKPT = ROOT / "checkpoints"
 CLEAN = ROOT / "data/processed/feature_cache"
@@ -52,7 +53,8 @@ PRIMARY = (0.999, 3)
 # ---------------- loading / alignment ----------------
 
 def load_native(cache_dir, expect_augment):
-    info = json.loads((cache_dir / "info.json").read_text())
+    info = validate_cache_directory(cache_dir, augment=expect_augment,
+                                    seed=42, smoke=False, root=ROOT)
     assert info["feature_names"] == FEATURE_NAMES, f"{cache_dir}: different feature set"
     assert not info["smoke"], f"{cache_dir} is a smoke cache"
     assert bool(info["augment"]) == expect_augment, f"{cache_dir}: unexpected augment flag"
@@ -162,6 +164,13 @@ def main():
     models = ["TCN", label]
     rng = np.random.default_rng(args.seed)
 
+    validate_current_artifact(CKPT / "mlp_split.json", "mlp_split", root=ROOT,
+                              expected_details={"seed": 42})
+    validate_current_artifact(CKPT / "tcn_eval_probs.npz", "tcn_eval_probs", root=ROOT,
+                              expected_details={"seed": 42})
+    validate_cache_directory(CLEAN, augment=False, seed=42, smoke=False, root=ROOT)
+    if args.hgb_train == "noisy":
+        validate_cache_directory(NOISY, augment=True, seed=42, smoke=False, root=ROOT)
     split = json.loads((CKPT / "mlp_split.json").read_text())["patients"]
     C = load_native(CLEAN, expect_augment=False)
     masks = split_masks(C, split)
@@ -263,12 +272,11 @@ def main():
     score_all = {m: np.concatenate([S["val"][m]["det"], S["test"][m]["det"]]) for m in models}
 
     def thrs_for(mdl, q):
-        cal = {"val": np.quantile(S["test"][mdl]["det"][Y["test"] != 2], q),
-               "test": np.quantile(S["val"][mdl]["det"][Y["val"] != 2], q)}
-        return [cal[s] for s in side]
+        validation_threshold = np.quantile(S["val"][mdl]["det"][Y["val"] != 2], q)
+        return [validation_threshold] * len(side)
 
     print("\n" + "=" * 96)
-    print("3. DETECTION EVENTS (val+test patients; threshold = non-ictal score quantile from the OTHER split)")
+    print("3. DETECTION EVENTS (test threshold calibrated on validation non-ictal scores)")
     print("   cells: detected/seizures (rate) | false alarms per hour | alarm duty = share of non-ictal "
           "windows with the alarm on | median latency")
     print(f"{'setting':<15}" + "".join(f"{m:>50}" for m in models))
