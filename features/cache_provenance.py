@@ -273,15 +273,29 @@ def preprocessing_config_fingerprint(dataset: str) -> str:
 
 
 def _processing_evidence_status(evidence, *, stem, dataset, expected_channels,
-                               source_registry):
+                               source_registry, processed_path=None):
     if not isinstance(evidence, dict):
         return False, "verified processing evidence is missing"
-    required = {"status", "source_file", "source_fingerprint",
-                "preprocessing_config_fingerprint", "channel_order", "sample_rate_hz", "units"}
+    required = {"schema_version", "status", "source_file", "source_fingerprint",
+                "preprocessing_config_fingerprint", "channel_order", "sample_rate_hz", "units",
+                "dataset", "output_file", "output_size", "output_sha256"}
     if not required.issubset(evidence):
         return False, "processing evidence fields are incomplete"
-    if evidence.get("status") != "VERIFIED":
-        return False, evidence.get("reason") or "processing evidence is not verified"
+    if evidence.get("schema_version") != 1 or evidence.get("status") != "VERIFIED":
+        return False, evidence.get("reason") or "processing evidence schema/status is not verified"
+    if evidence.get("dataset") != dataset:
+        return False, "processing evidence dataset does not match"
+    if processed_path is None or not Path(processed_path).is_file():
+        return False, "processed NPY is missing"
+    processed_path = Path(processed_path)
+    if evidence.get("output_file") != processed_path.name:
+        return False, "processing evidence output filename does not match"
+    if evidence.get("output_size") != processed_path.stat().st_size:
+        return False, "processed NPY size does not match its provenance sidecar"
+    if evidence.get("output_sha256") != _file_sha256(processed_path):
+        return False, "processed NPY content does not match its provenance sidecar"
+    if not isinstance(evidence.get("source_size"), int) or evidence["source_size"] <= 0:
+        return False, "processing evidence source size is missing or invalid"
     if str(evidence.get("source_file", "")).casefold() != f"{stem}.edf".casefold():
         return False, "processing source file does not match recording identity"
     if not evidence.get("source_fingerprint") or not evidence.get("preprocessing_config_fingerprint"):
@@ -303,7 +317,8 @@ def _processing_evidence_status(evidence, *, stem, dataset, expected_channels,
 
 def _recording_decision(quality: dict, source_ids: list, excluded: bool,
                         signal_quality: dict = None, processing_evidence: dict = None,
-                        stem: str = "", dataset: str = "", source_registry=None) -> tuple:
+                        stem: str = "", dataset: str = "", source_registry=None,
+                        processed_path: Path = None) -> tuple:
     """Return a fail-closed shared-index decision from source-backed fields."""
     if excluded:
         return "REJECTED", "patient is excluded by dataset policy"
@@ -329,7 +344,7 @@ def _recording_decision(quality: dict, source_ids: list, excluded: bool,
     processing_ok, processing_reason = _processing_evidence_status(
         processing_evidence, stem=stem, dataset=dataset,
         expected_channels=expected_channels,
-        source_registry=source_registry or {})
+        source_registry=source_registry or {}, processed_path=processed_path)
     if not processing_ok:
         return "REVIEW_REQUIRED", processing_reason
     return "ELIGIBLE", quality.get("reason") or "known trusted status and both permissions allow use"
@@ -396,6 +411,12 @@ def classify_recording_inventory(dataset: str, processed_dir: Path, quality_by_f
         source_ids = source_ids_by_file.get(stem, [])
         supplied_signal = (signal_quality_by_file or {}).get(stem)
         processing = (processing_evidence_by_file or {}).get(stem)
+        sidecar_path = processed_dir / (item["name"] + ".provenance.json")
+        if processing is None and sidecar_path.is_file():
+            try:
+                processing = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                processing = {"status": "INVALID", "reason": "processing sidecar is unreadable"}
         signal = inspect_signal_file(processed_dir / item["name"])
         if supplied_signal is not None and supplied_signal != signal:
             signal = {**signal, "status": "REVIEW_REQUIRED",
@@ -403,7 +424,7 @@ def classify_recording_inventory(dataset: str, processed_dir: Path, quality_by_f
                       ["supplied signal-quality evidence conflicts with a fresh scan"]}
         status, reason = _recording_decision(
             quality, source_ids, excluded, signal, processing, stem=stem, dataset=dataset,
-            source_registry=source_records)
+            source_registry=source_records, processed_path=processed_dir / item["name"])
         decisions.append({
             **item, "path": (processed_dir / item["name"]).as_posix(),
             "dataset": dataset, "stem": stem, "patient_id": patient_id,
@@ -483,7 +504,7 @@ def validate_eligibility_report(report: dict) -> None:
             (record.get("dataset"), record.get("patient_id")) in excluded,
             record.get("signal_quality"), record.get("processing_evidence"),
             stem=record.get("stem", ""), dataset=record.get("dataset", ""),
-            source_registry=sources)
+            source_registry=sources, processed_path=Path(report["processed_dir"]) / record["name"])
         if record.get("decision") != expected_decision or record.get("reason") != expected_reason:
             raise ValueError("eligibility report decision conflicts with its quality evidence")
         if record.get("source_evidence") != _record_source_evidence(
