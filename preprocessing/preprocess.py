@@ -85,9 +85,9 @@ def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
     # Do not silently drop duplicate labels. The target matcher treats an
-    # ambiguous exact label as unavailable and the quality gate reviews the
-    # resulting zero-padded channel. MNE may normalize duplicate EDF labels;
-    # the available names after reading remain the labels actually matched.
+    # ambiguous exact label as unavailable, and process_file refuses to save
+    # the recording. MNE may normalize duplicate EDF labels; matching uses the
+    # channel names available after reading.
 
     raw.filter(l_freq=BANDPASS_LOW, h_freq=BANDPASS_HIGH,
                fir_design="firwin", verbose=False)
