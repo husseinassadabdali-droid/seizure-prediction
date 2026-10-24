@@ -1,6 +1,8 @@
 """Synthetic tests for fail-closed preprocessing channel handling."""
 import tempfile
 import unittest
+import json
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -46,6 +48,28 @@ class PreprocessChannelIntegrityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "ambiguous duplicate label"):
                     preprocess.process_file(Path("record.edf"), out, self.targets, 50.0)
             self.assertEqual(list(out.glob("*.npy")), [])
+
+    def test_dataset_processing_writes_content_bound_provenance_sidecar(self):
+        names = ["D", "A", "F", "C", "B", "E"]
+        row_values = {"A": 10, "B": 20, "C": 30, "D": 40, "E": 50, "F": 60}
+        data = np.vstack([np.full(16, row_values[name]) for name in names])
+        raw = FakeRaw(names, data)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            edf = root / "record.edf"
+            edf.write_bytes(b"synthetic EDF header".ljust(256, bytes([0])) + b"payload")
+            with patch.object(preprocess, "load_and_filter", return_value=raw):
+                preprocess.process_file(edf, root, self.targets, 50.0, dataset_name="chbmit")
+            npy = root / "record.npy"
+            evidence = json.loads((root / "record.npy.provenance.json").read_text())
+            self.assertEqual(evidence["source_fingerprint"],
+                             hashlib.sha256(edf.read_bytes()[:256]).hexdigest())
+            self.assertEqual(evidence["output_sha256"],
+                             hashlib.sha256(npy.read_bytes()).hexdigest())
+            self.assertEqual(evidence["output_size"], npy.stat().st_size)
+            self.assertEqual(evidence["channel_order"], self.targets)
+            self.assertEqual(evidence["sample_rate_hz"], 250)
+            self.assertEqual(evidence["units"], "V")
 
     def test_complete_recording_saves_target_channels_in_requested_order(self):
         # EDF channels are deliberately shuffled; output must follow target order.
