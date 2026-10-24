@@ -679,9 +679,13 @@ class CacheProvenanceTests(unittest.TestCase):
             signal = inspect_signal_file(directory / "record.npy")
             source = {"record": [{"path": "synthetic/record.edf",
                                   "fingerprint": "edf-fp"}]}
+            npy_path = directory / "record.npy"
             evidence = {"record": {
-                "status": "VERIFIED", "source_file": "record.edf",
-                "source_fingerprint": "edf-fp",
+                "schema_version": 1, "status": "VERIFIED", "dataset": "chbmit",
+                "source_size": 1024, "output_file": npy_path.name,
+                "output_size": npy_path.stat().st_size,
+                "output_sha256": hashlib.sha256(npy_path.read_bytes()).hexdigest(),
+                "source_file": "record.edf", "source_fingerprint": "edf-fp",
                 "preprocessing_config_fingerprint": preprocessing_config_fingerprint("chbmit"),
                 "channel_order": ["wrong"] * 6, "sample_rate_hz": 250, "units": "V"}}
             report = classify_recording_inventory(
