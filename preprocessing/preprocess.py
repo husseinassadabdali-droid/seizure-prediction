@@ -117,14 +117,18 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
     channel_indices, missing, ambiguous = match_target_channels(
         available_ch_names, target_channels)
 
-    final_data = np.zeros((len(target_channels), n_samples), dtype=np.float32)
     missing_in_this_file = list(missing) + [f"{name} (ambiguous duplicate label)"
                                             for name in ambiguous]
+    if missing_in_this_file:
+        del raw
+        gc.collect()
+        raise ValueError(
+            "refusing to save recording with missing/ambiguous target channels: "
+            + ", ".join(missing_in_this_file))
 
+    final_data = np.empty((len(target_channels), n_samples), dtype=np.float32)
     for i, ch_idx in enumerate(channel_indices):
-        if ch_idx is not None:
-            final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
-        # A missing or ambiguous target remains zero padded and is reported.
+        final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
 
     output_path = output_dir / f"{edf_path.stem}.npy"
     np.save(output_path, final_data)
@@ -132,7 +136,7 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
     del raw, final_data
     gc.collect()
 
-    return missing_in_this_file
+    return []
 
 
 def process_dataset(dataset_name: str, project_root: Path, config: dict):
