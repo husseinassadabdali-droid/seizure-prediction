@@ -2,11 +2,10 @@
 Preprocessing pipeline for EEG seizure prediction.
 Reads raw EDF files from multiple datasets (CHB-MIT, Siena, ...), applies
 bandpass/notch filtering, standardizes channel order per dataset, and
-handles missing channels via zero-padding (preserving raw amplitudes).
+rejects recordings with missing or ambiguous target channels before saving.
 Channel lookup is case-insensitive to handle naming inconsistencies across
 files within the same dataset (e.g. "EEG Fp2" vs "EEG FP2").
-Includes a diagnostic report for missing channels to inform future
-masking decisions.
+Records with missing or ambiguous target channels are withheld and not saved as usable arrays.
 
 Note: Z-score normalization is intentionally not applied here. The MLP and TCN
 training paths fit frozen statistics from training patients after splitting.
@@ -103,12 +102,9 @@ def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
 def process_file(edf_path: Path, output_dir: Path, target_channels: list,
                   notch_freq: float) -> list:
     """
-    Extract target channels via case-insensitive name lookup (handles
-    naming inconsistencies like "EEG Fp2" vs "EEG FP2" across files of
-    the same dataset). Missing channels are zero-padded so every output
-    array has an identical shape (len(target_channels), n_samples).
-    Returns list of missing channels for diagnostic tracking. No Z-score
-    applied -- raw filtered amplitudes are saved as-is.
+    Extract target channels via case-insensitive exact-name lookup.
+    Missing or ambiguous targets raise before an output NPY is written.
+    Returns an empty list on success. No Z-score is applied.
     """
     raw = load_and_filter(str(edf_path), notch_freq)
     available_ch_names = raw.info["ch_names"]
