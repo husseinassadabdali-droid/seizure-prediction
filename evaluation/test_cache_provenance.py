@@ -1,6 +1,7 @@
 """Small metadata-only tests for cache and saved-result provenance."""
 import json
 import os
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -51,8 +52,13 @@ def _classify(dataset, processed_dir, quality, *, source_records_by_file,
             existing.append({"path": f"synthetic/{stem}.edf",
                              "fingerprint": f"synthetic-edf-{stem}"})
             source_records_by_file[stem] = existing
+        npy_path = processed_dir / item["name"]
         processing[stem] = {
-            "status": "VERIFIED", "source_file": stem + ".edf",
+            "schema_version": 1, "status": "VERIFIED", "dataset": dataset,
+            "source_size": 1024, "output_file": npy_path.name,
+            "output_size": npy_path.stat().st_size,
+            "output_sha256": hashlib.sha256(npy_path.read_bytes()).hexdigest(),
+            "source_file": stem + ".edf",
             "source_fingerprint": f"synthetic-edf-{stem}",
             "preprocessing_config_fingerprint": preprocessing_config_fingerprint(dataset),
             "channel_order": target_channels, "sample_rate_hz": 250, "units": "V",
