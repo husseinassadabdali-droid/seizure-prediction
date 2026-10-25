@@ -24,6 +24,7 @@ for sub in ("training", "models", "features", "evaluation"):
 from dataset import STEP_SEC  # noqa: E402
 from train_mlp import MLPClassifier, N_FEATURES, predict_proba, ALARM_SETTINGS  # noqa: E402
 from metrics import make_alarm, event_metrics, _runs  # noqa: E402
+from cache_provenance import validate_current_artifact  # noqa: E402
 
 MAX_GAP = 60.0
 N_SHIFTS = 100
@@ -148,6 +149,10 @@ def summarize(deltas, placebo, label):
 if __name__ == "__main__":
     self_test()
     ckpt = ROOT / "checkpoints"
+    validate_current_artifact(ckpt / "mlp_eval_data.pt", "mlp_eval_data", root=ROOT,
+                              expected_details={"seed": 42})
+    validate_current_artifact(ckpt / "mlp_classifier.pt", "mlp_classifier", root=ROOT,
+                              expected_details={"seed": 42})
     data = torch.load(ckpt / "mlp_eval_data.pt")
     model = MLPClassifier(N_FEATURES)
     model.load_state_dict(torch.load(ckpt / "mlp_classifier.pt", map_location="cpu"))

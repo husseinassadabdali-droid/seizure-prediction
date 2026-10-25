@@ -48,6 +48,8 @@ from mlp_branch import MLPBranch  # noqa: E402
 from handcrafted_features import extract_features_from_window, N_FEATURES_PER_CHANNEL  # noqa: E402
 from metrics import (confusion_matrix, per_class_metrics, window_level_report,  # noqa: E402
                      make_alarm, event_metrics, CLASS_NAMES)
+from cache_provenance import (build_dataset_provenance, validate_artifact_manifest,
+                              write_artifact_manifest, fingerprint)  # noqa: E402
 
 # ---- Config ----
 N_CLASSES = 3
@@ -263,13 +265,18 @@ def main():
         {"name": "siena", "processed_dir": ROOT / "data/processed/siena",
          "raw_dir": ROOT / "data/raw/siena", "notch_freq": 50.0},
     ]
+    source_fingerprint = build_dataset_provenance(configs)["dataset_fingerprint"]
 
-    base_ds = SeizureDataset(configs, apply_augmentation=True)     # training view (noisy)
-    clean_ds = copy.copy(base_ds)                                   # shares the index, no noise
-    clean_ds.apply_augmentation = False
+    base_ds = SeizureDataset(configs, apply_augmentation=True,
+                             normalization_mode="deferred")        # fit after patient split
     file_ids = file_order(base_ds)
 
     split, split_meta = patient_level_split(base_ds)
+    normalization_manifest = base_ds.fit_training_normalization(split["train"])
+    dataset_fingerprint = source_fingerprint
+    normalization_fingerprint = fingerprint(normalization_manifest)
+    clean_ds = copy.copy(base_ds)                                   # same frozen train stats
+    clean_ds.apply_augmentation = False
     for name in ("train", "val", "test"):
         print(f"{name:<5}: {len(split_meta[name]):2d} patient groups, {len(split[name]):>9,} windows")
 
@@ -280,6 +287,10 @@ def main():
     (ckpt_dir / "mlp_split.json").write_text(json.dumps(
         {"patients": split_meta, "seed": SEED, "val_fraction": VAL_FRACTION,
          "test_fraction": TEST_FRACTION}, indent=2))
+    write_artifact_manifest(ckpt_dir / "mlp_split.json", dataset_fingerprint,
+                            "mlp_split", {"seed": SEED, "patients": split_meta,
+                                          "normalization": normalization_manifest,
+                                          "normalization_fingerprint": normalization_fingerprint})
 
     rng = np.random.default_rng(SEED)
     by_label_train = indices_by_label(base_ds, split["train"])
@@ -336,6 +347,14 @@ def main():
             best, bad_epochs = val_bal, 0
             torch.save(model.mlp_branch.state_dict(), branch_path)
             torch.save(model.state_dict(), classifier_path)
+            write_artifact_manifest(branch_path, dataset_fingerprint, "mlp_branch",
+                                    {"seed": SEED, "best_val_balanced_accuracy": float(best),
+                                     "normalization": normalization_manifest,
+                                     "normalization_fingerprint": normalization_fingerprint})
+            write_artifact_manifest(classifier_path, dataset_fingerprint, "mlp_classifier",
+                                    {"seed": SEED, "best_val_balanced_accuracy": float(best),
+                                     "normalization": normalization_manifest,
+                                     "normalization_fingerprint": normalization_fingerprint})
             print(f"  -> new best ({best:.4f}); saved branch + classifier", flush=True)
         else:
             bad_epochs += 1
@@ -346,6 +365,9 @@ def main():
     (ckpt_dir / "mlp_history.json").write_text(json.dumps(history, indent=2))
 
     # ---- final evaluation with the best checkpoint ----
+    validate_artifact_manifest(classifier_path, dataset_fingerprint, "mlp_classifier",
+                               expected_details={"seed": SEED,
+                                                 "normalization_fingerprint": normalization_fingerprint})
     model.load_state_dict(torch.load(classifier_path, map_location=device))
     print(f"\nBest validation balanced accuracy: {best:.4f}")
     print_report("VALIDATION", val_data, predict_proba(model, val_data["X"], device))
@@ -353,6 +375,9 @@ def main():
     test_data = build_eval_data(clean_ds, split["test"], "test", file_ids)
     print_report("TEST (final numbers)", test_data, predict_proba(model, test_data["X"], device))
     torch.save({"val": val_data, "test": test_data}, ckpt_dir / "mlp_eval_data.pt")
+    write_artifact_manifest(ckpt_dir / "mlp_eval_data.pt", dataset_fingerprint,
+                            "mlp_eval_data", {"seed": SEED, "split": split_meta,
+                                              "normalization_fingerprint": normalization_fingerprint})
     print(f"\nSaved: {branch_path.name}, {classifier_path.name}, mlp_split.json, "
           f"mlp_eval_data.pt, mlp_history.json  (in {ckpt_dir})")
 
