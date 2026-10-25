@@ -301,8 +301,8 @@ class CacheProvenanceTests(unittest.TestCase):
             with patch("numpy.load", wraps=np.load) as load:
                 with self.assertRaisesRegex(ValueError, "content"):
                     validate_processed_npy_manifest(processed_dir, eligibility_report=report)
-                self.assertTrue(any(call.kwargs.get("mmap_mode") == "r"
-                                    for call in load.call_args_list))
+                self.assertFalse(any(call.kwargs.get("mmap_mode") == "r"
+                                     for call in load.call_args_list))
 
     def test_processed_npy_manifest_rejects_missing_and_changed_inventory(self):
         with tempfile.TemporaryDirectory() as temp:
