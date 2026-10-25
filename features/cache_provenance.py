@@ -590,7 +590,6 @@ def validate_processed_npy_manifest(processed_dir: Path, *, eligibility_report: 
         raise ValueError("processed NPY manifest decisions or reasons do not match current report")
     if manifest.get("quality_policy_fingerprint") != eligibility_report.get("quality_policy_fingerprint"):
         raise ValueError("processed NPY manifest quality policy does not match")
-    validate_eligibility_report(eligibility_report)
     eligible = sorted(record["name"] for record in eligibility_report["recordings"]
                       if record["decision"] == "ELIGIBLE")
     recorded = manifest.get("files")
@@ -606,6 +605,7 @@ def validate_processed_npy_manifest(processed_dir: Path, *, eligibility_report: 
         if entry.get("size") != source.stat().st_size or entry.get("sha256") != _file_sha256(source):
             raise ValueError(f"processed NPY content does not match manifest: {name}")
         verified.append({"name": name, "size": entry["size"], "sha256": entry["sha256"]})
+    validate_eligibility_report(eligibility_report)
     return verified
 
 
