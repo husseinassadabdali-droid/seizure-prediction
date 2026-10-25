@@ -577,7 +577,6 @@ def validate_processed_npy_manifest(processed_dir: Path, *, eligibility_report: 
         raise ValueError("processed NPY content manifest schema is unsupported")
     if manifest.get("processed_dir") != str(processed_dir):
         raise ValueError("processed NPY manifest belongs to a different directory")
-    validate_eligibility_report(eligibility_report)
     current_inventory = inventory_processed_files(processed_dir)
     if current_inventory != eligibility_report["inventory"]:
         raise ValueError("current processed inventory does not match eligibility report")
@@ -591,6 +590,7 @@ def validate_processed_npy_manifest(processed_dir: Path, *, eligibility_report: 
         raise ValueError("processed NPY manifest decisions or reasons do not match current report")
     if manifest.get("quality_policy_fingerprint") != eligibility_report.get("quality_policy_fingerprint"):
         raise ValueError("processed NPY manifest quality policy does not match")
+    validate_eligibility_report(eligibility_report)
     eligible = sorted(record["name"] for record in eligibility_report["recordings"]
                       if record["decision"] == "ELIGIBLE")
     recorded = manifest.get("files")
