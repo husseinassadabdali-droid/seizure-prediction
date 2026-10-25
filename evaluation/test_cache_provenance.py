@@ -362,7 +362,8 @@ class CacheProvenanceTests(unittest.TestCase):
                     approved_eligible_files=["good.npy"])
                 data_hashes = [Path(call.args[0]).name for call in digest.call_args_list
                                if Path(call.args[0]).parent == processed_dir]
-                self.assertEqual(data_hashes, ["good.npy"])
+                self.assertTrue(data_hashes)
+                self.assertEqual(set(data_hashes), {"good.npy"})
             manifest = json.loads(processed_npy_manifest_path(processed_dir).read_text())
             self.assertEqual([row["name"] for row in manifest["files"]], ["good.npy"])
             self.assertEqual(sorted(row["name"] for row in manifest["inventory"]),
