@@ -342,7 +342,8 @@ def final_evaluation(args, model, device, clean_ds, split, file_ids, ckpt_dir,
         ev = evaluate_full(model, clean_ds, split[key], file_ids, 256,
                            args.num_workers, device, use_amp, name)
         print_report(name, {"y": torch.from_numpy(ev["y"]),
-                            "times": torch.from_numpy(ev["times"])}, ev["probs"])
+                            "times": torch.from_numpy(ev["times"]),
+                            "groups": torch.from_numpy(ev["groups"])}, ev["probs"])
         for field in ("probs", "y", "times", "groups"):
             saved[f"{key}_{field}"] = ev[field]
         saved[f"{key}_group_names"] = np.array(ev["group_names"])
