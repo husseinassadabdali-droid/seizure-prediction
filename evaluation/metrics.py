@@ -80,18 +80,43 @@ def window_level_report(y_true, probs) -> dict:
 
 # ---------------- event-level ----------------
 
-def make_alarm(probs, threshold: float = 0.5, min_consecutive: int = 1) -> np.ndarray:
-    """
-    Alarm score = P(preictal) + P(ictal) = 1 - P(interictal).
-    min_consecutive > 1 requires that many consecutive windows above the
-    threshold before the alarm fires (suppresses isolated false alarms).
-    Note: the consecutive check ignores time gaps between windows.
-    """
-    raw = (1.0 - np.asarray(probs)[:, 0]) >= threshold
-    if min_consecutive <= 1:
+def make_alarm(probs, threshold: float = 0.5, min_consecutive: int = 1,
+               times=None, group_ids=None, max_gap_sec: float = None) -> np.ndarray:
+    probs = np.asarray(probs)
+    if probs.ndim != 2 or probs.shape[1] < 1:
+        raise ValueError("probs must be a 2D array with at least one class column")
+    if min_consecutive < 1:
+        raise ValueError("min_consecutive must be at least 1")
+    raw = (1.0 - probs[:, 0]) >= threshold
+    if min_consecutive == 1:
         return raw
-    counts = np.convolve(raw.astype(int), np.ones(min_consecutive, dtype=int), mode="full")[: len(raw)]
-    return counts >= min_consecutive
+    n = len(raw)
+    times = np.arange(n, dtype=float) if times is None else np.asarray(times, dtype=float)
+    groups = np.zeros(n, dtype=np.int64) if group_ids is None else np.asarray(group_ids)
+    if len(times) != n or len(groups) != n:
+        raise ValueError("probs, times, and group_ids must have equal lengths")
+    if not np.isfinite(times).all():
+        raise ValueError("times must contain only finite values")
+    max_gap = float(max_gap_sec) if max_gap_sec is not None else float("inf")
+    if max_gap <= 0:
+        raise ValueError("max_gap_sec must be positive")
+    alarm = np.zeros(n, dtype=bool)
+    run_start = 0
+    for i in range(n + 1):
+        boundary = i == n
+        if not boundary:
+            boundary = (groups[i] != groups[i - 1] or
+                        times[i] - times[i - 1] > max_gap or
+                        times[i] < times[i - 1])
+        if boundary:
+            segment = raw[run_start:i]
+            if len(segment) >= min_consecutive:
+                counts = np.convolve(segment.astype(np.int64),
+                                     np.ones(min_consecutive, dtype=np.int64),
+                                     mode="full")[:len(segment)]
+                alarm[run_start:i] = counts >= min_consecutive
+            run_start = i
+    return alarm
 
 
 def _runs(mask, times, max_gap):
@@ -113,14 +138,47 @@ def _runs(mask, times, max_gap):
     return runs
 
 
-def event_metrics(y_true, alarm, times, step_sec: float = 2.0, max_gap_sec: float = None) -> dict:
+def event_metrics(y_true, alarm, times, step_sec: float = 2.0,
+                  max_gap_sec: float = None, group_ids=None) -> dict:
     y_true = np.asarray(y_true)
     alarm = np.asarray(alarm, dtype=bool)
     times = np.asarray(times, dtype=float)
-    # Windows further apart than max_gap are non-contiguous. Default suits one continuous
-    # recording; pass ~60 when files of a patient are stitched on a clock timeline
-    # (consecutive files are a few seconds apart).
+    if y_true.ndim != 1 or alarm.ndim != 1 or times.ndim != 1:
+        raise ValueError("y_true, alarm, and times must be one-dimensional")
+    if not (len(y_true) == len(alarm) == len(times)):
+        raise ValueError("y_true, alarm, and times must have equal lengths")
+    if not np.isfinite(times).all():
+        raise ValueError("times must contain only finite values")
+    if step_sec <= 0:
+        raise ValueError("step_sec must be positive")
+    if group_ids is not None:
+        groups = np.asarray(group_ids)
+        if groups.ndim != 1 or len(groups) != len(y_true):
+            raise ValueError("group_ids must have the same length as y_true")
+        parts = [event_metrics(y_true[groups == group], alarm[groups == group],
+                               times[groups == group], step_sec, max_gap_sec)
+                 for group in np.unique(groups)]
+        totals = {key: sum(part[key] for part in parts)
+                  for key in ("n_seizures", "predicted_in_advance",
+                              "detected_only_during_seizure", "missed",
+                              "false_alarms")}
+        lead_values = [part["mean_lead_time_sec"] * part["predicted_in_advance"]
+                       for part in parts if part["predicted_in_advance"]]
+        lead_sum = sum(lead_values)
+        n_early = totals["predicted_in_advance"]
+        hours = sum(part["interictal_hours"] for part in parts)
+        n_seiz = totals["n_seizures"]
+        return {
+            **totals,
+            "event_sensitivity_prediction": n_early / n_seiz if n_seiz else float("nan"),
+            "event_sensitivity_any": (n_early + totals["detected_only_during_seizure"]) / n_seiz if n_seiz else float("nan"),
+            "mean_lead_time_sec": lead_sum / n_early if n_early else float("nan"),
+            "interictal_hours": float(hours),
+            "false_alarms_per_hour": totals["false_alarms"] / hours if hours > 0 else float("nan"),
+        }
     max_gap = float(max_gap_sec) if max_gap_sec is not None else 1.5 * step_sec
+    if max_gap <= 0:
+        raise ValueError("max_gap_sec must be positive")
 
     n_early = n_ictal_only = n_missed = 0
     lead_times = []
