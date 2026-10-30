@@ -140,6 +140,10 @@ def inspect_signal_array(array, *, policy=None) -> dict:
                 "shape": list(getattr(array, "shape", ())),
                 "policy_fingerprint": fingerprint(config), "channels": []}
     n_channels, n_samples = map(int, array.shape)
+    if n_channels <= 0:
+        issues.append("array has zero channels")
+    if n_samples <= 0:
+        issues.append("array has zero samples")
     if n_channels != int(config["expected_channels"]):
         issues.append(f"channel count {n_channels} != expected {config['expected_channels']}")
     dtype = str(getattr(array, "dtype", "unknown"))
