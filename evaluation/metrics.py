@@ -176,6 +176,9 @@ def event_metrics(y_true, alarm, times, step_sec: float = 2.0,
             "interictal_hours": float(hours),
             "false_alarms_per_hour": totals["false_alarms"] / hours if hours > 0 else float("nan"),
         }
+    if np.any(np.diff(times) < 0):
+        raise ValueError("times must be non-decreasing within each group")
+
     max_gap = float(max_gap_sec) if max_gap_sec is not None else 1.5 * step_sec
     if max_gap <= 0:
         raise ValueError("max_gap_sec must be positive")
