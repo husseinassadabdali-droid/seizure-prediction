@@ -36,6 +36,14 @@ class TemporalAlarmTests(unittest.TestCase):
         self.assertEqual(result["predicted_in_advance"], 1)
         self.assertEqual(result["missed"], 1)
 
+    def test_event_metrics_rejects_reversed_timestamps(self):
+        with self.assertRaisesRegex(ValueError, "non-decreasing"):
+            event_metrics(
+                np.array([0, 1, 2]),
+                np.array([False, True, False]),
+                np.array([0.0, 4.0, 2.0]),
+            )
+
     def test_mismatched_group_length_is_rejected(self):
         with self.assertRaises(ValueError):
             event_metrics(np.array([0, 1]), np.array([False, True]),
