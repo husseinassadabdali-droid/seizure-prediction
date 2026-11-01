@@ -57,6 +57,20 @@ class TemporalAlarmTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite"):
             make_alarm(probs, min_consecutive=1, times=np.array([0.0, np.nan]))
 
+    def test_make_alarm_rejects_reversed_timestamps_without_confirmation_delay(self):
+        probs = np.array([[0.1, 0.8, 0.1], [0.1, 0.8, 0.1]])
+        with self.assertRaisesRegex(ValueError, "non-decreasing"):
+            make_alarm(probs, min_consecutive=1, times=np.array([2.0, 0.0]))
+
+    def test_event_metrics_rejects_non_finite_step_and_gap(self):
+        labels = np.array([0, 0])
+        alarm = np.array([False, False])
+        times = np.array([0.0, 2.0])
+        with self.assertRaisesRegex(ValueError, "step_sec"):
+            event_metrics(labels, alarm, times, step_sec=np.nan)
+        with self.assertRaisesRegex(ValueError, "max_gap_sec"):
+            event_metrics(labels, alarm, times, max_gap_sec=np.inf)
+
     def test_event_metrics_rejects_reversed_timestamps(self):
         with self.assertRaisesRegex(ValueError, "non-decreasing"):
             event_metrics(
