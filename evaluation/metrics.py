@@ -88,18 +88,18 @@ def make_alarm(probs, threshold: float = 0.5, min_consecutive: int = 1,
     if min_consecutive < 1:
         raise ValueError("min_consecutive must be at least 1")
     raw = (1.0 - probs[:, 0]) >= threshold
-    if min_consecutive == 1:
-        return raw
     n = len(raw)
     times = np.arange(n, dtype=float) if times is None else np.asarray(times, dtype=float)
     groups = np.zeros(n, dtype=np.int64) if group_ids is None else np.asarray(group_ids)
-    if len(times) != n or len(groups) != n:
-        raise ValueError("probs, times, and group_ids must have equal lengths")
+    if times.ndim != 1 or groups.ndim != 1 or len(times) != n or len(groups) != n:
+        raise ValueError("probs, times, and group_ids must have equal one-dimensional lengths")
     if not np.isfinite(times).all():
         raise ValueError("times must contain only finite values")
+    if max_gap_sec is not None and (not np.isfinite(max_gap_sec) or max_gap_sec <= 0):
+        raise ValueError("max_gap_sec must be positive and finite")
+    if min_consecutive == 1:
+        return raw
     max_gap = float(max_gap_sec) if max_gap_sec is not None else float("inf")
-    if max_gap <= 0:
-        raise ValueError("max_gap_sec must be positive")
     alarm = np.zeros(n, dtype=bool)
     run_start = 0
     for i in range(n + 1):
@@ -136,6 +136,33 @@ def _runs(mask, times, max_gap):
     if start is not None:
         runs.append((start, len(mask) - 1))
     return runs
+
+
+def _interictal_exposure_seconds(y_true, times, step_sec, max_gap):
+    """Union duration of observed interictal step intervals; gaps add no exposure."""
+    intervals = []
+    for i, (label, start) in enumerate(zip(y_true, times)):
+        if label != INTERICTAL:
+            continue
+        end = start + step_sec
+        if i + 1 < len(times):
+            delta = times[i + 1] - start
+            if 0 < delta <= max_gap:
+                end = min(end, times[i + 1])
+        if end > start:
+            intervals.append((float(start), float(end)))
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    total = 0.0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    return total + current_end - current_start
 
 
 def event_metrics(y_true, alarm, times, step_sec: float = 2.0,
@@ -207,7 +234,7 @@ def event_metrics(y_true, alarm, times, step_sec: float = 2.0,
         1 for (s, e) in _runs(alarm, times, max_gap)
         if np.all(y_true[s:e + 1] == INTERICTAL)
     )
-    interictal_hours = (y_true == INTERICTAL).sum() * step_sec / 3600.0
+    interictal_hours = _interictal_exposure_seconds(y_true, times, step_sec, max_gap) / 3600.0
 
     n_seiz = len(seizures)
     return {
