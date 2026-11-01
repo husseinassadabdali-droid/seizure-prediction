@@ -97,6 +97,10 @@ def make_alarm(probs, threshold: float = 0.5, min_consecutive: int = 1,
         raise ValueError("times must contain only finite values")
     if max_gap_sec is not None and (not np.isfinite(max_gap_sec) or max_gap_sec <= 0):
         raise ValueError("max_gap_sec must be positive and finite")
+    for group in np.unique(groups):
+        group_times = times[groups == group]
+        if np.any(np.diff(group_times) < 0):
+            raise ValueError("times must be non-decreasing within each group")
     if min_consecutive == 1:
         return raw
     max_gap = float(max_gap_sec) if max_gap_sec is not None else float("inf")
@@ -176,8 +180,10 @@ def event_metrics(y_true, alarm, times, step_sec: float = 2.0,
         raise ValueError("y_true, alarm, and times must have equal lengths")
     if not np.isfinite(times).all():
         raise ValueError("times must contain only finite values")
-    if step_sec <= 0:
-        raise ValueError("step_sec must be positive")
+    if not np.isfinite(step_sec) or step_sec <= 0:
+        raise ValueError("step_sec must be positive and finite")
+    if max_gap_sec is not None and (not np.isfinite(max_gap_sec) or max_gap_sec <= 0):
+        raise ValueError("max_gap_sec must be positive and finite")
     if group_ids is not None:
         groups = np.asarray(group_ids)
         if groups.ndim != 1 or len(groups) != len(y_true):
