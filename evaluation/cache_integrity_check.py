@@ -1,6 +1,5 @@
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +26,17 @@ def load_cache(path, expected_augment=None, chunk_rows=65536):
     with (path / "info.json").open(encoding="utf-8") as stream:
         info = json.load(stream)
 
+    if not isinstance(info, dict):
+        fail(f"{path}: info.json must contain a JSON object")
+    if not isinstance(info.get("augment"), bool):
+        fail(f"{path}: info augment flag is missing or is not boolean")
+    if expected_augment is not None and info["augment"] is not expected_augment:
+        fail(f"{path}: augment={info['augment']}, expected {expected_augment}")
+    if not isinstance(info.get("feature_names"), list):
+        fail(f"{path}: feature_names must be a list")
+    if not isinstance(chunk_rows, int) or chunk_rows < 1:
+        fail("chunk_rows must be a positive integer")
+
     X = np.load(path / "features.npy", mmap_mode="r", allow_pickle=False)
     with np.load(path / "meta.npz", allow_pickle=False) as archive:
         missing = REQUIRED_META.difference(archive.files)
@@ -45,8 +55,10 @@ def load_cache(path, expected_augment=None, chunk_rows=65536):
         fail(f"{path}: info n_features does not match feature matrix shape")
     if len(info.get("feature_names", [])) != X.shape[1]:
         fail(f"{path}: feature_names length does not match feature matrix width")
-    if expected_augment is not None and bool(info.get("augment")) != expected_augment:
-        fail(f"{path}: augment={info.get('augment')}, expected {expected_augment}")
+    if X.shape[1] == 0:
+        fail(f"{path}: feature matrix has no columns")
+    if not np.issubdtype(X.dtype, np.number):
+        fail(f"{path}: feature matrix must have a numeric dtype")
 
     for key in ("y", "time_sec", "start_sample", "index_idx", "file_id",
                 "patient_code", "dataset_code"):
@@ -58,6 +70,18 @@ def load_cache(path, expected_augment=None, chunk_rows=65536):
         fail(f"{path}: labels contain values outside 0, 1, 2")
     if not np.isfinite(meta["time_sec"]).all():
         fail(f"{path}: time_sec contains non-finite values")
+    for key in ("start_sample", "index_idx", "file_id", "patient_code", "dataset_code"):
+        if not np.issubdtype(meta[key].dtype, np.integer):
+            fail(f"{path}: {key} must use an integer dtype")
+    for key in ("patient_names", "dataset_names"):
+        if meta[key].ndim != 1 or len(meta[key]) == 0:
+            fail(f"{path}: {key} must be a non-empty vector")
+        if not np.issubdtype(meta[key].dtype, np.str_):
+            fail(f"{path}: {key} must contain strings")
+        if len(np.unique(meta[key])) != len(meta[key]):
+            fail(f"{path}: {key} contains duplicate names")
+    if (meta["file_id"] < 0).any():
+        fail(f"{path}: file_id contains negative values")
     if (meta["start_sample"] < 0).any() or (meta["index_idx"] < 0).any():
         fail(f"{path}: negative sample/index values")
     if len(np.unique(meta["index_idx"])) != n:
