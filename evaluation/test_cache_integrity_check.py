@@ -38,6 +38,8 @@ def write_cache(root, *, augment=False, labels=None, index=None, features=None):
             "ictal": int(np.count_nonzero(labels == 2)),
         },
     }
+    if augment is None:
+        info.pop("augment")
     (root / "info.json").write_text(json.dumps(info), encoding="utf-8")
 
 
@@ -73,6 +75,32 @@ class CacheIntegrityCheckTests(unittest.TestCase):
             path = Path(temp) / "clean"
             write_cache(path, index=[0, 0, 2])
             with self.assertRaisesRegex(ValueError, "duplicate rows"):
+                load_cache(path)
+
+    def test_missing_augmentation_flag_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "clean"
+            write_cache(path, augment=None)
+            with self.assertRaisesRegex(ValueError, "augment flag is missing"):
+                load_cache(path, expected_augment=False)
+
+    def test_non_boolean_augmentation_flag_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "clean"
+            write_cache(path, augment="false")
+            with self.assertRaisesRegex(ValueError, "augment flag is missing"):
+                load_cache(path, expected_augment=False)
+
+    def test_non_integer_index_metadata_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "clean"
+            write_cache(path)
+            meta_path = path / "meta.npz"
+            with np.load(meta_path, allow_pickle=False) as archive:
+                meta = {key: archive[key] for key in archive.files}
+            meta["index_idx"] = meta["index_idx"].astype(np.float64)
+            np.savez(meta_path, **meta)
+            with self.assertRaisesRegex(ValueError, "index_idx must use an integer dtype"):
                 load_cache(path)
 
     def test_clean_and_noisy_metadata_must_match(self):
