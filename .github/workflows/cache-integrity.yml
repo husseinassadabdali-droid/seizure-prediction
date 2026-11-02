@@ -1,0 +1,32 @@
+name: Cache integrity validation
+
+on:
+  pull_request:
+    paths:
+      - "evaluation/cache_integrity_check.py"
+      - "evaluation/test_cache_integrity_check.py"
+      - ".github/workflows/cache-integrity.yml"
+  push:
+    branches:
+      - main
+      - improve/inference-and-data-validation
+    paths:
+      - "evaluation/cache_integrity_check.py"
+      - "evaluation/test_cache_integrity_check.py"
+      - ".github/workflows/cache-integrity.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cache-integrity-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependency
+        run: python -m pip install --upgrade numpy
+      - name: Run cache integrity tests
+        run: python -m unittest evaluation.test_cache_integrity_check -v
