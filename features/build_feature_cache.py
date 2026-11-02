@@ -12,12 +12,13 @@ Layout (default data/processed/feature_cache/):
                            patient_code/names, dataset_code/names
   info.json                config used to build it
 
-Shard names embed a hash of (path, window starts, patient mean/std, flags,
-feature names), so shards built under different labeling/normalization are
+Shard names embed a hash of source identity, window starts, cache policy,
+augmentation settings, notch, and feature names, so incompatible shards are
 never silently reused.
 
-Features are computed from the CLEAN z-scored window by default. --augment
-builds a second cache with fixed-seed dry-electrode noise (separate folder).
+Features are computed from the clean processed signal without fitting channel
+normalization on the full cohort. LOSO feature scaling is fit inside each fold
+from its training rows only. --augment builds a noisy copy in a separate folder.
 
 Usage:
   python3 build_feature_cache.py --smoke      # 4 recordings, minutes, full pipeline
@@ -32,9 +33,9 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import argparse
-import hashlib
 import json
 import sys
+import tempfile
 import time
 from multiprocessing import Pool
 from pathlib import Path
@@ -50,17 +51,20 @@ from dataset import (SeizureDataset, FS, WINDOW_SEC, STEP_SEC, PREICTAL_SEC,  # 
 from handcrafted_features import (extract_features_from_window, FEATURE_NAMES,  # noqa: E402
                                   N_FEATURES_PER_CHANNEL)
 from noise_injection import apply_dry_electrode_augmentation  # noqa: E402
+from cache_provenance import (  # noqa: E402
+    CACHE_SCHEMA_VERSION, SHARD_SCHEMA_VERSION, DEFAULT_AUGMENTATION_CONFIG,
+    RAW_FEATURE_NORMALIZATION_POLICY, build_cache_provenance,
+    cache_file_signatures, default_dataset_configs, shard_fingerprint,
+    validate_cache_directory, shard_manifest_path, validate_shard_manifest,
+    write_shard_manifest,
+)
 
 WIN = int(WINDOW_SEC * FS)
 N_FEAT = 6 * N_FEATURES_PER_CHANNEL
-CACHE_VERSION = 1
+CACHE_VERSION = 5
 
-CONFIGS = [
-    {"name": "chbmit", "processed_dir": ROOT / "data/processed/chbmit",
-     "raw_dir": ROOT / "data/raw/chbmit", "notch_freq": 60.0},
-    {"name": "siena", "processed_dir": ROOT / "data/processed/siena",
-     "raw_dir": ROOT / "data/raw/siena", "notch_freq": 50.0},
-]
+CONFIGS = default_dataset_configs(ROOT)
+AUGMENT_CONFIG = dict(DEFAULT_AUGMENTATION_CONFIG)
 
 
 def cache_dir_for(augment, smoke):
@@ -92,39 +96,44 @@ def build_segments(ds):
     return segs
 
 
-def make_tasks(ds, segs, shard_dir, augment, seed):
+def make_tasks(ds, segs, shard_dir, augment, seed, cache_provenance_fingerprint):
     tasks = []
+    augmentation_config = dict(AUGMENT_CONFIG) if augment else {}
     for seg_id, lo, hi in segs:
         first = ds.index[lo]
-        mean, std = ds.patient_stats_cache[(first["dataset"], first["patient_id"])]
         starts = np.fromiter((ds.index[i]["start_sample"] for i in range(lo, hi)),
                              dtype=np.int64, count=hi - lo)
         path = str(first["npy_path"])
-        h = hashlib.md5()
-        for part in (path.encode(), starts.tobytes(), mean.tobytes(), std.tobytes(),
-                     f"{augment}|{seed}|{first['notch_freq']}|{CACHE_VERSION}".encode(),
-                     "|".join(FEATURE_NAMES).encode()):
-            h.update(part)
-        out = shard_dir / f"{seg_id:05d}_{h.hexdigest()[:12]}.npy"
-        tasks.append((seg_id, path, starts, mean, std, first["notch_freq"],
-                      augment, seed, str(out)))
+        shard_key = shard_fingerprint(
+            path, starts.tobytes(), b"", b"", FEATURE_NAMES,
+            augmentation_config, augment, seed, first["notch_freq"],
+            cache_provenance_fingerprint)
+        out = shard_dir / f"{seg_id:05d}_s{SHARD_SCHEMA_VERSION}_{shard_key}.npy"
+        tasks.append((seg_id, path, starts, first["notch_freq"],
+                      augment, seed, str(out), augmentation_config, shard_key,
+                      cache_provenance_fingerprint))
     return tasks
 
 
 def work(task):
     """Compute (or reuse) the feature shard of one recording file."""
-    seg_id, path, starts, mean, std, notch, augment, seed, out_path = task
+    (seg_id, path, starts, notch, augment, seed, out_path,
+     augmentation_config, shard_key, build_fingerprint) = task
     out = Path(out_path)
     n = len(starts)
+    manifest_path = shard_manifest_path(out)
     if out.exists():
-        try:
-            if np.load(out, mmap_mode="r").shape == (n, N_FEAT):
-                return seg_id, n, True
-        except Exception:
-            pass
+        validate_shard_manifest(
+            out, shard_key=shard_key, build_fingerprint=build_fingerprint,
+            expected_shape=(n, N_FEAT), expected_dtype="float32")
+        shard = np.load(out, mmap_mode="r")
+        if shard.shape != (n, N_FEAT) or shard.dtype != np.float32:
+            raise ValueError(f"shard array shape or dtype is invalid: {out}")
+        return seg_id, n, True
+    if manifest_path.exists():
+        raise ValueError(f"orphan shard manifest without its shard: {manifest_path}")
 
     arr = np.load(path).astype(np.float32, copy=False)
-    arr = (arr - mean[:, None]) / std[:, None]      # same ops as SeizureDataset.__getitem__
     rng = np.random.default_rng([seed, seg_id]) if augment else None
 
     feats = np.empty((n, N_FEAT), dtype=np.float32)
@@ -132,19 +141,35 @@ def work(task):
         s = int(starts[k])
         w = arr[:, s:s + WIN]
         if augment:
-            w = apply_dry_electrode_augmentation(w, fs=FS, notch_freq=notch, rng=rng)
+            w = apply_dry_electrode_augmentation(
+                w, fs=FS, notch_freq=notch, rng=rng, **augmentation_config)
         feats[k] = extract_features_from_window(w, fs=FS)
 
-    tmp = out.with_name(out.name + ".tmp.npy")
-    np.save(tmp, feats)
-    os.replace(tmp, out)
+    with tempfile.NamedTemporaryFile(dir=out.parent, prefix=f".{out.name}.",
+                                     suffix=".tmp.npy", delete=False) as handle:
+        tmp = Path(handle.name)
+        np.save(handle, feats)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        # Hard-link creation is atomic and fails instead of replacing an existing shard.
+        os.link(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    write_shard_manifest(out, shard_key=shard_key,
+                         build_fingerprint=build_fingerprint,
+                         expected_shape=(n, N_FEAT), expected_dtype="float32")
     return seg_id, n, False
 
 
 # ---------------- build ----------------
 
 def build(args):
-    ds = SeizureDataset(CONFIGS, apply_augmentation=False)
+    provenance = build_cache_provenance(
+        CONFIGS, augment=args.augment, seed=args.seed, smoke=args.smoke,
+        augmentation_config=AUGMENT_CONFIG if args.augment else {},
+        signal_normalization_policy=RAW_FEATURE_NORMALIZATION_POLICY)
+    ds = SeizureDataset(CONFIGS, apply_augmentation=False, normalization_mode="none")
     segs_all = build_segments(ds)
     if args.smoke:
         keep = sorted({0, 1, len(segs_all) // 2, len(segs_all) - 1})
@@ -157,7 +182,8 @@ def build(args):
     shard_dir = cache_dir / "shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = make_tasks(ds, segs, shard_dir, args.augment, args.seed)
+    tasks = make_tasks(ds, segs, shard_dir, args.augment, args.seed,
+                       provenance["fingerprint"])
     total = sum(len(t[1 + 1]) for t in tasks)   # len(starts)
     print(f"{len(tasks)} recordings, {total:,} windows -> {cache_dir} "
           f"({args.workers} workers, augment={args.augment})")
@@ -183,8 +209,12 @@ def build(args):
     X = np.empty((total, N_FEAT), dtype=np.float32)
     row = 0
     for task, (_, lo, hi) in zip(tasks, segs):
-        shard = np.load(task[-1])
-        assert shard.shape == (hi - lo, N_FEAT), f"bad shard {task[-1]}"
+        shard_path = Path(task[-4])
+        validate_shard_manifest(
+            shard_path, shard_key=task[-2], build_fingerprint=task[-1],
+            expected_shape=(hi - lo, N_FEAT), expected_dtype="float32")
+        shard = np.load(shard_path)
+        assert shard.shape == (hi - lo, N_FEAT), f"bad shard {shard_path}"
         X[row:row + len(shard)] = shard
         row += len(shard)
     assert row == total
@@ -213,7 +243,8 @@ def build(args):
              patient_names=np.array(patient_names), dataset_code=dataset_code,
              dataset_names=np.array(dataset_names))
     info = {
-        "cache_version": CACHE_VERSION, "n_windows": int(total), "n_features": N_FEAT,
+        "cache_version": CACHE_VERSION, "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "n_windows": int(total), "n_features": N_FEAT,
         "feature_names": FEATURE_NAMES, "augment": bool(args.augment), "seed": args.seed,
         "smoke": bool(args.smoke), "fs": FS, "window_sec": WINDOW_SEC, "step_sec": STEP_SEC,
         "preictal_sec": PREICTAL_SEC, "postictal_sec": POSTICTAL_SEC, "buffer_sec": BUFFER_SEC,
@@ -221,6 +252,8 @@ def build(args):
         "label_counts": {"interictal": int((y == 0).sum()), "preictal": int((y == 1).sum()),
                          "ictal": int((y == 2).sum())},
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "provenance": provenance,
+        "cache_files": cache_file_signatures(cache_dir),
     }
     (cache_dir / "info.json").write_text(json.dumps(info, indent=2))
     print(f"Saved {total:,} x {N_FEAT} features ({X.nbytes / 1e6:.0f} MB), "
@@ -229,27 +262,34 @@ def build(args):
     if args.augment:
         print("Verification skipped (noisy cache is not bitwise reproducible from the dataset).")
     else:
-        verify(ds, cache_dir)
+        verify(ds, cache_dir, expected_provenance=provenance,
+               seed=args.seed, smoke=args.smoke)
 
 
 # ---------------- load / verify ----------------
 
-def load_cache(cache_dir=None, mmap=True):
+def load_cache(cache_dir=None, mmap=True, *, expected_augment=False,
+               expected_seed=42, expected_smoke=False, expected_provenance=None):
     """Returns (X, meta, info). X is memory-mapped by default (read-only)."""
     d = Path(cache_dir) if cache_dir else cache_dir_for(False, False)
+    info = validate_cache_directory(
+        d, expected_provenance=expected_provenance, dataset_configs=CONFIGS,
+        augment=expected_augment, seed=expected_seed, smoke=expected_smoke, root=ROOT)
     X = np.load(d / "features.npy", mmap_mode="r" if mmap else None)
     meta = {k: v for k, v in np.load(d / "meta.npz").items()}
-    info = json.loads((d / "info.json").read_text())
     assert info["feature_names"] == FEATURE_NAMES, \
         "cache was built with a different feature set; rebuild it"
     assert X.shape == (info["n_windows"], N_FEAT)
     return X, meta, info
 
 
-def verify(ds, cache_dir, n=100, seed=0):
+def verify(ds, cache_dir, n=100, seed=0, *, expected_provenance=None,
+           cache_seed=42, smoke=False):
     """(1) labels/times of every cached row equal the current dataset's;
     (2) n random windows recomputed through the dataset's own __getitem__."""
-    X, meta, info = load_cache(cache_dir)
+    X, meta, info = load_cache(cache_dir, expected_seed=cache_seed,
+                               expected_smoke=smoke,
+                               expected_provenance=expected_provenance)
     assert not info["augment"], "verify only supports the clean cache"
     idx = meta["index_idx"]
 
@@ -289,7 +329,11 @@ if __name__ == "__main__":
     if args.verify:
         if args.augment:
             sys.exit("--verify supports only the clean cache")
-        ds_ = SeizureDataset(CONFIGS, apply_augmentation=False)
-        verify(ds_, args.cache_dir or cache_dir_for(False, args.smoke))
+        provenance = build_cache_provenance(
+            CONFIGS, augment=False, seed=args.seed, smoke=args.smoke,
+            augmentation_config={})
+        ds_ = SeizureDataset(CONFIGS, apply_augmentation=False, normalization_mode="none")
+        verify(ds_, args.cache_dir or cache_dir_for(False, args.smoke),
+               expected_provenance=provenance, cache_seed=args.seed, smoke=args.smoke)
     else:
         build(args)

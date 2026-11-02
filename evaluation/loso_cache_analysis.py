@@ -34,6 +34,8 @@ for sub in ("features", "evaluation"):
 
 from handcrafted_features import FEATURE_NAMES, N_FEATURES_PER_CHANNEL  # noqa: E402
 from metrics import event_metrics, roc_auc_binary, _runs  # noqa: E402
+from cache_provenance import (validate_cache_directory, build_dataset_provenance,
+                              write_artifact_manifest, fold_normalization_manifest)  # noqa: E402
 
 STEP_SEC = 2.0
 CACHE = ROOT / "data/processed/feature_cache"
@@ -47,7 +49,7 @@ MIN_WIN = 100                                # windows needed in each band
 # ---------------- loading ----------------
 
 def load_cache(selected):
-    info = json.loads((CACHE / "info.json").read_text())
+    info = validate_cache_directory(CACHE, augment=False, seed=42, smoke=False, root=ROOT)
     assert info["feature_names"] == FEATURE_NAMES, "cache built with a different feature set"
     assert not info["augment"] and not info["smoke"], "need the full clean cache"
     X = np.load(CACHE / "features.npy")
@@ -80,8 +82,6 @@ def load_cache(selected):
 
 def plant_signal(X, y, t, blocks, effect):
     feats = [k * N_FEATURES_PER_CHANNEL + FEATURE_NAMES.index("rel_beta") for k in range(6)]
-    sub = X[:: max(1, len(X) // 200000)]
-    _, scale = robust_stats(sub)
     n_planted = 0
     for a, b, _ in blocks:
         ys, ts = y[a:b], t[a:b]
@@ -95,9 +95,9 @@ def plant_signal(X, y, t, blocks, effect):
         idx, pos = idx[ok], pos[ok]
         ramp = np.clip((1800.0 - (onsets[pos] - ts[idx])) / 1800.0, 0.0, 1.0)
         for j in feats:
-            X[a + idx, j] += effect * scale[j] * ramp
+            X[a + idx, j] += effect * ramp  # fixed synthetic units; no cohort-fitted scale
         n_planted += len(idx)
-    print(f"PLANTED SIGNAL: +{effect} robust units x ramp on rel_beta (6 channels), "
+    print(f"PLANTED SIGNAL: +{effect} fixed feature units x ramp on rel_beta (6 channels), "
           f"{n_planted:,} preictal windows modified (in memory only)")
 
 
@@ -113,6 +113,16 @@ def robust_stats(Xs):
 
 def transform(X, center, scale):
     return np.clip((X - center) / scale, -10, 10).astype(np.float32)
+
+
+def fit_fold_feature_scaler(X, training_rows, training_patients):
+    """Fit the robust feature scaler exclusively from this fold's train rows."""
+    training_rows = np.asarray(training_rows, dtype=np.int64)
+    if training_rows.size == 0:
+        raise ValueError("cannot fit fold feature normalization without training rows")
+    center, scale = robust_stats(X[training_rows])
+    manifest = fold_normalization_manifest(training_patients, center, scale)
+    return center, scale, manifest
 
 
 def fit_logreg(Xt, yt, steps=300, lr=0.05, l2=1e-3):
@@ -131,6 +141,8 @@ def fit_logreg(Xt, yt, steps=300, lr=0.05, l2=1e-3):
 
 def loso(X, y, grp, gnames, models, cap, seed):
     scores = {m: np.zeros(len(y), dtype=np.float32) for m in models}
+    fold_normalization = []
+    fold_calibration = {m: {} for m in models}
     rng = np.random.default_rng(seed)
     if "hgb" in models:
         from sklearn.ensemble import HistGradientBoostingClassifier
@@ -141,25 +153,39 @@ def loso(X, y, grp, gnames, models, cap, seed):
         pos = np.flatnonzero(train & (y == 1))
         neg = np.flatnonzero(train & (y == 0))
         n = min(cap // 2, len(pos), len(neg))
-        sel = np.concatenate([rng.choice(pos, n, replace=False), rng.choice(neg, n, replace=False)])
+        n_neg_fit = min(n, max(1, len(neg) // 2))
+        sel_pos = rng.choice(pos, n, replace=False)
+        sel_neg = rng.choice(neg, n_neg_fit, replace=False)
+        sel = np.concatenate([sel_pos, sel_neg])
         rng.shuffle(sel)
+        cal = np.setdiff1d(neg, sel_neg)
+        if cal.size == 0:
+            cal = sel_neg  # only when the training fold has no held-out calibration negatives
         Xs, ys = X[sel], (y[sel] == 1).astype(np.int64)
-        center, scale = robust_stats(Xs)
+        fit_patients = sorted(gnames[g] for g in np.unique(grp[sel]))
+        center, scale, norm_manifest = fit_fold_feature_scaler(X, sel, fit_patients)
+        fold_normalization.append({"held_out_patient": gname, **norm_manifest})
         Xt, Xh = transform(Xs, center, scale), transform(X[test], center, scale)
         if "logreg" in models:
             w, b = fit_logreg(Xt, ys)
             scores["logreg"][test] = 1.0 / (1.0 + np.exp(-(Xh @ w + b)))
+            cal_scores = 1.0 / (1.0 + np.exp(-(transform(X[cal], center, scale) @ w + b)))
+            fold_calibration["logreg"][gname] = {
+                duty: float(np.quantile(cal_scores, 1.0 - duty)) for duty in (0.02, 0.05, 0.10)}
         if "hgb" in models:
             clf = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.1,
                                                  max_leaf_nodes=31, early_stopping=False,
                                                  random_state=0)
             clf.fit(Xt, ys)
             scores["hgb"][test] = clf.predict_proba(Xh)[:, 1]
+            cal_scores = clf.predict_proba(transform(X[cal], center, scale))[:, 1]
+            fold_calibration["hgb"][gname] = {
+                duty: float(np.quantile(cal_scores, 1.0 - duty)) for duty in (0.02, 0.05, 0.10)}
         if (gi + 1) % 4 == 0 or gi + 1 == len(gnames):
             el = time.time() - t0
             print(f"  LOSO fold {gi + 1}/{len(gnames)} ({gname}) | elapsed {el / 60:.1f} min | "
                   f"ETA {el / (gi + 1) * (len(gnames) - gi - 1) / 60:.1f} min", flush=True)
-    return scores
+    return scores, fold_normalization, fold_calibration
 
 
 # ---------------- helpers ----------------
@@ -240,7 +266,7 @@ def summarize(rows, title):
 
 # ---------------- analyses ----------------
 
-def analyse(model, s, y, t, f, pc, blocks, args, rng):
+def analyse(model, s, y, t, f, pc, blocks, args, rng, fold_calibration):
     print("\n" + "=" * 86 + f"\nMODEL: {model}\n" + "=" * 86)
 
     # ---- 1. per-patient window AUC + session-identity control ----
@@ -316,11 +342,12 @@ def analyse(model, s, y, t, f, pc, blocks, args, rng):
 
     # ---- 4. A: event-level chance baseline at fixed duty cycles ----
     print(f"\n--- 4. A. event-level vs circular-shift chance ({args.shifts} shifts) ---")
-    print("    per-patient threshold = score quantile (no labels used) -> fixed alarm duty cycle")
+    print("    threshold is calibrated on non-ictal training-fold rows; no held-out signal or label is used")
     for duty in (0.02, 0.05, 0.10):
         alarm = np.zeros(len(y), dtype=bool)
-        for a, b, _ in blocks:
-            alarm[a:b] = s[a:b] >= np.quantile(s[a:b], 1.0 - duty)
+        for a, b, patient in blocks:
+            group = ALIAS.get(patient, patient)
+            alarm[a:b] = s[a:b] >= fold_calibration[group][duty]
         obs = event_metrics(y, alarm, t, STEP_SEC, MAX_GAP)
         ne, nf = [], []
         for _ in range(args.shifts):
@@ -372,14 +399,21 @@ def main():
     if args.plant:
         plant_signal(X, y, t, blocks, args.plant)
 
-    scores = loso(X, y, grp, gnames, models, args.train_cap, args.seed)
+    scores, fold_normalization, fold_calibration = loso(
+        X, y, grp, gnames, models, args.train_cap, args.seed)
     tag = "_".join(selected) + (f"_plant{args.plant}" if args.plant else "")
     out = ROOT / "checkpoints" / f"loso_oof_{tag}.npz"
     np.savez_compressed(out, t=t, y=y, f=f, pc=pc, **scores)
+    dataset_fp = build_dataset_provenance()["dataset_fingerprint"]
+    write_artifact_manifest(out, dataset_fp, "loso_oof",
+                            {"datasets": selected, "seed": args.seed,
+                             "models": models, "train_cap": args.train_cap,
+                             "fold_normalization": fold_normalization,
+                             "fold_calibration": fold_calibration})
     print(f"saved out-of-fold scores to {out}")
 
     for m in models:
-        analyse(m, scores[m], y, t, f, pc, blocks, args, rng)
+        analyse(m, scores[m], y, t, f, pc, blocks, args, rng, fold_calibration[m])
 
 
 if __name__ == "__main__":

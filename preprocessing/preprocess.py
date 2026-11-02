@@ -2,22 +2,23 @@
 Preprocessing pipeline for EEG seizure prediction.
 Reads raw EDF files from multiple datasets (CHB-MIT, Siena, ...), applies
 bandpass/notch filtering, standardizes channel order per dataset, and
-handles missing channels via zero-padding (preserving raw amplitudes).
+rejects recordings with missing or ambiguous target channels before saving.
 Channel lookup is case-insensitive to handle naming inconsistencies across
 files within the same dataset (e.g. "EEG Fp2" vs "EEG FP2").
-Includes a diagnostic report for missing channels to inform future
-masking decisions.
+Records with missing or ambiguous target channels are withheld and not saved as usable arrays.
 
-Note: Z-score normalization is intentionally NOT applied here. It is applied
-later in dataset.py, computed per-patient across all of that patient's
-recordings combined -- not per single file -- to preserve real inter-file
-baseline differences and keep raw values available for future recalibration
-against the dry-electrode device.
+Note: Z-score normalization is intentionally not applied here. The MLP and TCN
+training paths fit frozen statistics from training patients after splitting.
+Legacy/demo callers may still select per-patient normalization in dataset.py.
 """
 
 import mne
 import numpy as np
 import gc
+import hashlib
+import json
+import os
+import tempfile
 from pathlib import Path
 
 # ---- Config ----
@@ -56,15 +57,41 @@ DATASETS = {
 }
 
 
+def match_target_channels(available_channels: list, target_channels: list):
+    """Match exact channel labels case-insensitively; never infer substitutes.
+
+    Returns (indices, missing, ambiguous). Whitespace around EDF labels is
+    ignored. A target with duplicate matching labels is ambiguous and is not
+    selected, avoiding the old dict-overwrite/first-index behavior.
+    """
+    matches = {}
+    for index, name in enumerate(available_channels):
+        key = str(name).strip().casefold()
+        matches.setdefault(key, []).append(index)
+
+    indices, missing, ambiguous = [], [], []
+    for target in target_channels:
+        key = str(target).strip().casefold()
+        found = matches.get(key, [])
+        if len(found) == 1:
+            indices.append(found[0])
+        elif not found:
+            indices.append(None)
+            missing.append(target)
+        else:
+            indices.append(None)
+            ambiguous.append(target)
+    return indices, missing, ambiguous
+
+
 def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
     """Load an EDF file and apply bandpass + notch filtering."""
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
 
-    # Some files have duplicate channel names; drop duplicates
-    ch_names = raw.info["ch_names"]
-    duplicates = [ch for ch in ch_names if ch_names.count(ch) > 1]
-    if duplicates:
-        raw.drop_channels(duplicates[1::2])
+    # Do not silently drop duplicate labels. The target matcher treats an
+    # ambiguous exact label as unavailable, and process_file refuses to save
+    # the recording. MNE may normalize duplicate EDF labels; matching uses the
+    # channel names available after reading.
 
     raw.filter(l_freq=BANDPASS_LOW, h_freq=BANDPASS_HIGH,
                fir_design="firwin", verbose=False)
@@ -76,42 +103,120 @@ def load_and_filter(edf_path: str, notch_freq: float) -> mne.io.Raw:
     return raw
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _edf_header_sha256(path: Path) -> str:
+    with Path(path).open("rb") as handle:
+        return hashlib.sha256(handle.read(256)).hexdigest()
+
+
+def _canonical_fingerprint(value) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _processing_config_fingerprint(dataset_name: str) -> str:
+    config = DATASETS[dataset_name]
+    return _canonical_fingerprint({
+        "dataset": dataset_name, "target_sfreq": TARGET_SFREQ,
+        "bandpass_low": BANDPASS_LOW, "bandpass_high": BANDPASS_HIGH,
+        "notch_freq": config.get("notch_freq"),
+        "channel_order": list(config.get("target_channels", [])), "units": "V",
+        "preprocess_code_sha256": _sha256_file(Path(__file__).resolve()),
+        "mne_version": getattr(mne, "__version__", None), "numpy_version": np.__version__,
+    })
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def process_file(edf_path: Path, output_dir: Path, target_channels: list,
-                  notch_freq: float) -> list:
+                  notch_freq: float, dataset_name: str = None) -> list:
     """
-    Extract target channels via case-insensitive name lookup (handles
-    naming inconsistencies like "EEG Fp2" vs "EEG FP2" across files of
-    the same dataset). Missing channels are zero-padded so every output
-    array has an identical shape (len(target_channels), n_samples).
-    Returns list of missing channels for diagnostic tracking. No Z-score
-    applied -- raw filtered amplitudes are saved as-is.
+    Extract target channels via case-insensitive exact-name lookup.
+    Missing or ambiguous targets raise before an output NPY is written.
+    Returns an empty list on success. No Z-score is applied.
     """
     raw = load_and_filter(str(edf_path), notch_freq)
     available_ch_names = raw.info["ch_names"]
     n_samples = raw.n_times
 
-    # Case-insensitive lookup table: lowercase name -> actual channel name
-    lower_to_actual = {ch.lower(): ch for ch in available_ch_names}
+    channel_indices, missing, ambiguous = match_target_channels(
+        available_ch_names, target_channels)
 
-    final_data = np.zeros((len(target_channels), n_samples), dtype=np.float32)
-    missing_in_this_file = []
+    missing_in_this_file = list(missing) + [f"{name} (ambiguous duplicate label)"
+                                            for name in ambiguous]
+    if missing_in_this_file:
+        del raw
+        gc.collect()
+        raise ValueError(
+            "refusing to save recording with missing/ambiguous target channels: "
+            + ", ".join(missing_in_this_file))
 
-    for i, target_ch in enumerate(target_channels):
-        actual_ch = lower_to_actual.get(target_ch.lower())
-        if actual_ch is not None:
-            ch_idx = available_ch_names.index(actual_ch)
-            final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
-        else:
-            missing_in_this_file.append(target_ch)
-            # final_data[i, :] stays zero (zero-padding)
+    final_data = np.empty((len(target_channels), n_samples), dtype=np.float32)
+    for i, ch_idx in enumerate(channel_indices):
+        final_data[i, :] = raw.get_data(picks=[ch_idx])[0]
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{edf_path.stem}.npy"
-    np.save(output_path, final_data)
+    fd, temp_name = tempfile.mkstemp(prefix=output_path.name + ".", suffix=".tmp", dir=output_dir)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.save(handle, final_data, allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, output_path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+    # Production dataset runs must identify the dataset so the evidence can be
+    # checked against the current channel/filter policy. Legacy utility callers
+    # may omit it, in which case no verified sidecar is issued.
+    if dataset_name is not None:
+        if dataset_name not in DATASETS:
+            raise ValueError(f"unknown dataset for processing provenance: {dataset_name}")
+        evidence = {
+            "schema_version": 1, "status": "VERIFIED",
+            "source_file": Path(edf_path).name,
+            "source_fingerprint": _edf_header_sha256(edf_path),
+            "source_size": Path(edf_path).stat().st_size,
+            "preprocessing_config_fingerprint": _processing_config_fingerprint(dataset_name),
+            "channel_order": list(target_channels), "sample_rate_hz": TARGET_SFREQ,
+            "units": "V", "dataset": dataset_name,
+            "output_file": output_path.name, "output_size": output_path.stat().st_size,
+            "output_sha256": _sha256_file(output_path),
+        }
+        _atomic_json(output_path.with_name(output_path.name + ".provenance.json"), evidence)
 
     del raw, final_data
     gc.collect()
 
-    return missing_in_this_file
+    return []
 
 
 def process_dataset(dataset_name: str, project_root: Path, config: dict):
@@ -139,7 +244,7 @@ def process_dataset(dataset_name: str, project_root: Path, config: dict):
     for edf_path in edf_files:
         try:
             print(f"Processing: {edf_path.name} ... ", end="")
-            missing = process_file(edf_path, processed_dir, target_channels, notch_freq)
+            missing = process_file(edf_path, processed_dir, target_channels, notch_freq, dataset_name=dataset_name)
 
             if missing:
                 files_with_missing_channels += 1

@@ -18,11 +18,16 @@ for sub in ("evaluation", "features"):
 from loso_cache_analysis import load_cache  # noqa: E402
 from detection_loso import QUANTILES, PRIMARY, run_setting, short  # noqa: E402
 from metrics import roc_auc_binary  # noqa: E402
+from cache_provenance import validate_current_artifact  # noqa: E402
 
 model = sys.argv[1] if len(sys.argv) > 1 else "hgb"
+scores_path = ROOT / "checkpoints" / f"detect_oof_chbmit_{model}.npz"
+validate_current_artifact(scores_path, "detection_oof", root=ROOT,
+                          expected_details={"datasets": ["chbmit"], "model": model,
+                                            "seed": 0, "train_cap": 120000})
 X, y, t, f, pc, grp, blocks, gnames = load_cache(["chbmit"])
 del X
-d = np.load(ROOT / "checkpoints" / f"detect_oof_chbmit_{model}.npz")
+d = np.load(scores_path)
 scores, thr = d["scores"], d["thr"]
 assert len(scores) == len(y) and np.array_equal(d["y"], y) and np.array_equal(d["t"], t)
 

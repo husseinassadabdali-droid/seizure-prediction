@@ -41,6 +41,7 @@ from loso_cache_analysis import ALIAS, robust_stats, transform  # noqa: E402
 from detection_loso import (QUANTILES, SMOOTH_K, PRIMARY, MAX_GAP, STEP_SEC, run_setting,  # noqa: E402
                             pooled, chance, fit_predict, short)
 from metrics import roc_auc_binary, _runs  # noqa: E402
+from cache_provenance import validate_cache_directory  # noqa: E402
 
 CLEAN = ROOT / "data/processed/feature_cache"
 NOISY = ROOT / "data/processed/feature_cache_aug"
@@ -59,8 +60,12 @@ SCENARIOS = [  # (name, train, calibration, test)
 # ---------------- loading ----------------
 
 def load_pair(selected):
+    infos = {
+        "clean": validate_cache_directory(CLEAN, augment=False, seed=42, smoke=False, root=ROOT),
+        "noisy": validate_cache_directory(NOISY, augment=True, seed=42, smoke=False, root=ROOT),
+    }
     for tag, d in (("clean", CLEAN), ("noisy", NOISY)):
-        info = json.loads((d / "info.json").read_text())
+        info = infos[tag]
         assert info["feature_names"] == FEATURE_NAMES, f"{d}: different feature set"
         assert not info["smoke"], f"{d} is a smoke cache"
         assert bool(info["augment"]) == (tag == "noisy"), f"{d}: unexpected augment flag"

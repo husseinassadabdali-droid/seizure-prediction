@@ -62,6 +62,8 @@ from channel_attention import ChannelAttention  # noqa: E402
 from tcn_branch import TCNBranch  # noqa: E402
 from train_mlp import (patient_level_split, indices_by_label, sample_balanced_epoch,  # noqa: E402
                        class_weights_from_counts, file_order, macro_recall, print_report)
+from cache_provenance import (build_dataset_provenance, validate_artifact_manifest,
+                              write_artifact_manifest, fingerprint)  # noqa: E402
 
 # ---- Config ----
 N_CLASSES = 3
@@ -138,12 +140,18 @@ def make_val_subsample(ds, val_idx, n_interictal, seed=SEED):
     return np.sort(np.concatenate([by[PREICTAL], by[ICTAL], inter]))
 
 
-def check_split_consistency(split_meta, ckpt_dir):
+def check_split_consistency(split_meta, ckpt_dir, dataset_fingerprint=None,
+                            normalization_fingerprint=None):
     path = ckpt_dir / "mlp_split.json"
     if not path.exists():
         print("Note: mlp_split.json not found yet; the MLP script computes the same split "
               "deterministically (same seed/fractions).")
         return
+    if dataset_fingerprint is not None:
+        from cache_provenance import validate_artifact_manifest
+        validate_artifact_manifest(path, dataset_fingerprint, "mlp_split",
+                                   expected_details={"seed": SEED,
+                                                     "normalization_fingerprint": normalization_fingerprint})
     saved = json.loads(path.read_text())["patients"]
     if saved != split_meta:
         raise SystemExit("ERROR: this patient split differs from checkpoints/mlp_split.json. "
@@ -213,7 +221,8 @@ def evaluate_full(model, ds, indices, file_ids, batch_size, num_workers, device,
     return {"probs": probs, "y": y, "times": times, "groups": groups, "group_names": names}
 
 
-def run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir):
+def run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir,
+                 dataset_fingerprint, normalization_manifest):
     use_amp = device.type == "cuda"
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -238,6 +247,9 @@ def run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir):
 
     start_epoch, best, bad_epochs, history = 1, -1.0, 0, []
     if args.resume and resume_path.exists():
+        validate_artifact_manifest(resume_path, dataset_fingerprint, "tcn_resume",
+                                   expected_details={"seed": SEED,
+                                                     "normalization_fingerprint": fingerprint(normalization_manifest)})
         ck = torch.load(resume_path, map_location=device)
         model.load_state_dict(ck["model"])
         optimizer.load_state_dict(ck["optimizer"])
@@ -282,6 +294,18 @@ def run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir):
             torch.save(model.tcn_branch.state_dict(), branch_path)
             torch.save(model.attention.state_dict(), attention_path)
             torch.save(model.state_dict(), classifier_path)
+            write_artifact_manifest(branch_path, dataset_fingerprint, "tcn_branch",
+                                    {"seed": SEED, "best_val_balanced_accuracy": float(best),
+                                     "normalization": normalization_manifest,
+                                     "normalization_fingerprint": fingerprint(normalization_manifest)})
+            write_artifact_manifest(attention_path, dataset_fingerprint, "tcn_attention",
+                                    {"seed": SEED, "best_val_balanced_accuracy": float(best),
+                                     "normalization": normalization_manifest,
+                                     "normalization_fingerprint": fingerprint(normalization_manifest)})
+            write_artifact_manifest(classifier_path, dataset_fingerprint, "tcn_classifier",
+                                    {"seed": SEED, "best_val_balanced_accuracy": float(best),
+                                     "normalization": normalization_manifest,
+                                     "normalization_fingerprint": fingerprint(normalization_manifest)})
             print(f"  -> new best ({best:.4f}); saved branch + attention + classifier", flush=True)
         else:
             bad_epochs += 1
@@ -290,6 +314,10 @@ def run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir):
                     "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
                     "epoch": epoch, "best": best, "bad_epochs": bad_epochs,
                     "history": history}, resume_path)
+        write_artifact_manifest(resume_path, dataset_fingerprint, "tcn_resume",
+                                {"seed": SEED, "epoch": epoch,
+                                 "normalization": normalization_manifest,
+                                 "normalization_fingerprint": fingerprint(normalization_manifest)})
 
         if bad_epochs >= PATIENCE:
             print(f"  Early stopping: no improvement for {PATIENCE} epochs")
@@ -298,11 +326,15 @@ def run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir):
     print(f"\nBest per-epoch validation balanced accuracy (subsample): {best:.4f}")
 
 
-def final_evaluation(args, model, device, clean_ds, split, file_ids, ckpt_dir):
+def final_evaluation(args, model, device, clean_ds, split, file_ids, ckpt_dir,
+                     dataset_fingerprint, normalization_manifest):
     use_amp = device.type == "cuda"
     classifier_path = ckpt_dir / "tcn_classifier.pt"
     if not classifier_path.exists():
         raise SystemExit(f"No checkpoint at {classifier_path}. Train first.")
+    validate_artifact_manifest(classifier_path, dataset_fingerprint, "tcn_classifier",
+                               expected_details={"seed": SEED,
+                                                 "normalization_fingerprint": fingerprint(normalization_manifest)})
     model.load_state_dict(torch.load(classifier_path, map_location=device))
 
     saved = {}
@@ -315,7 +347,13 @@ def final_evaluation(args, model, device, clean_ds, split, file_ids, ckpt_dir):
             saved[f"{key}_{field}"] = ev[field]
         saved[f"{key}_group_names"] = np.array(ev["group_names"])
 
-    np.savez_compressed(ckpt_dir / "tcn_eval_probs.npz", **saved)
+    eval_path = ckpt_dir / "tcn_eval_probs.npz"
+    np.savez_compressed(eval_path, **saved)
+    write_artifact_manifest(eval_path, dataset_fingerprint, "tcn_eval_probs",
+                            {"seed": SEED,
+                             "split_sizes": {name: int(len(indices))
+                                             for name, indices in split.items()},
+                             "normalization_fingerprint": fingerprint(normalization_manifest)})
     print(f"\nSaved evaluation probabilities to {ckpt_dir / 'tcn_eval_probs.npz'}")
 
 
@@ -433,25 +471,38 @@ def main():
         {"name": "siena", "processed_dir": ROOT / "data/processed/siena",
          "raw_dir": ROOT / "data/raw/siena", "notch_freq": 50.0},
     ]
+    source_fingerprint = build_dataset_provenance(configs)["dataset_fingerprint"]
 
-    base_ds = SeizureDataset(configs, apply_augmentation=True)     # training view (noisy)
-    clean_ds = copy.copy(base_ds)                                   # shares the index, no noise
-    clean_ds.apply_augmentation = False
+    base_ds = SeizureDataset(configs, apply_augmentation=True,
+                             normalization_mode="deferred")        # fit after patient split
     file_ids = file_order(base_ds)
 
     split, split_meta = patient_level_split(base_ds)
+    normalization_manifest = base_ds.fit_training_normalization(split["train"])
+    dataset_fingerprint = source_fingerprint
+    normalization_fingerprint = fingerprint(normalization_manifest)
+    clean_ds = copy.copy(base_ds)                                   # same frozen train stats
+    clean_ds.apply_augmentation = False
     for name in ("train", "val", "test"):
         print(f"{name:<5}: {len(split_meta[name]):2d} patient groups, {len(split[name]):>9,} windows")
 
     ckpt_dir = ROOT / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    check_split_consistency(split_meta, ckpt_dir)
-    (ckpt_dir / "tcn_split.json").write_text(json.dumps({"patients": split_meta, "seed": SEED}, indent=2))
+    check_split_consistency(split_meta, ckpt_dir, dataset_fingerprint,
+                            normalization_fingerprint)
+    split_path = ckpt_dir / "tcn_split.json"
+    split_path.write_text(json.dumps({"patients": split_meta, "seed": SEED}, indent=2))
+    write_artifact_manifest(split_path, dataset_fingerprint, "tcn_split",
+                            {"seed": SEED, "patients": split_meta,
+                             "normalization": normalization_manifest,
+                             "normalization_fingerprint": normalization_fingerprint})
 
     model = TCNClassifier().to(device)
     if not args.eval_only:
-        run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir)
-    final_evaluation(args, model, device, clean_ds, split, file_ids, ckpt_dir)
+        run_training(args, model, device, base_ds, clean_ds, split, ckpt_dir,
+                     dataset_fingerprint, normalization_manifest)
+    final_evaluation(args, model, device, clean_ds, split, file_ids, ckpt_dir,
+                     dataset_fingerprint, normalization_manifest)
 
 
 if __name__ == "__main__":
