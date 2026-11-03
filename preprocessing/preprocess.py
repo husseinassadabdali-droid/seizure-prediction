@@ -157,9 +157,16 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
     Missing or ambiguous targets raise before an output NPY is written.
     Returns an empty list on success. No Z-score is applied.
     """
+    if dataset_name is not None and dataset_name not in DATASETS:
+        raise ValueError(f"unknown dataset for processing provenance: {dataset_name}")
+
     raw = load_and_filter(str(edf_path), notch_freq)
     available_ch_names = raw.info["ch_names"]
     n_samples = raw.n_times
+    if n_samples <= 0:
+        del raw
+        gc.collect()
+        raise ValueError("refusing to save recording with zero samples")
 
     channel_indices, missing, ambiguous = match_target_channels(
         available_ch_names, target_channels)
@@ -186,6 +193,9 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
             np.save(handle, final_data, allow_pickle=False)
             handle.flush()
             os.fsync(handle.fileno())
+        provenance_path = output_path.with_name(output_path.name + ".provenance.json")
+        if provenance_path.exists():
+            provenance_path.unlink()
         os.replace(temp_name, output_path)
     except Exception:
         try:
@@ -198,8 +208,6 @@ def process_file(edf_path: Path, output_dir: Path, target_channels: list,
     # checked against the current channel/filter policy. Legacy utility callers
     # may omit it, in which case no verified sidecar is issued.
     if dataset_name is not None:
-        if dataset_name not in DATASETS:
-            raise ValueError(f"unknown dataset for processing provenance: {dataset_name}")
         evidence = {
             "schema_version": 1, "status": "VERIFIED",
             "source_file": Path(edf_path).name,
