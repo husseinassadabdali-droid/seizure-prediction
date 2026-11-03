@@ -131,6 +131,8 @@ def group_key(entry):
 
 def patient_level_split(ds):
     groups = sorted({group_key(e) for e in ds.index})
+    if len(groups) < 3:
+        raise ValueError(f"Patient-level 3-way split requires at least 3 groups; found {len(groups)}")
     rng = np.random.default_rng(SEED)
     groups = [groups[i] for i in rng.permutation(len(groups))]
 
@@ -139,6 +141,8 @@ def patient_level_split(ds):
     val_g = set(groups[:n_val])
     test_g = set(groups[n_val:n_val + n_test])
     train_g = set(groups[n_val + n_test:])
+    if not train_g or not val_g or not test_g:
+        raise ValueError("Patient-level split produced an empty train, validation, or test group")
 
     split = {"train": [], "val": [], "test": []}
     for i, e in enumerate(ds.index):
@@ -160,6 +164,10 @@ def indices_by_label(ds, indices):
 
 def sample_balanced_epoch(by_label, rng):
     n_pre = len(by_label[PREICTAL])
+    if n_pre == 0:
+        raise ValueError("Training split contains no preictal windows")
+    if len(by_label[INTERICTAL]) == 0:
+        raise ValueError("Training split contains no interictal windows")
     n_inter = min(len(by_label[INTERICTAL]), INTERICTAL_MULTIPLIER * n_pre)
     inter = rng.choice(by_label[INTERICTAL], size=n_inter, replace=False)
     epoch = np.concatenate([by_label[PREICTAL], by_label[ICTAL], inter])
@@ -243,8 +251,11 @@ def print_report(name, data, probs):
     print(f"===== {name}: event-level (alarm score = 1 - P(interictal)) =====")
     times = data["times"].numpy()
     for thr, k in ALARM_SETTINGS:
-        alarm = make_alarm(probs, threshold=thr, min_consecutive=k)
-        ev = event_metrics(y, alarm, times, step_sec=STEP_SEC, max_gap_sec=60.0)
+        groups = data["groups"].numpy()
+        alarm = make_alarm(probs, threshold=thr, min_consecutive=k,
+                           times=times, group_ids=groups, max_gap_sec=60.0)
+        ev = event_metrics(y, alarm, times, step_sec=STEP_SEC,
+                           max_gap_sec=60.0, group_ids=groups)
         print(f"  thr={thr:.2f} consec={k}: seizures={ev['n_seizures']} "
               f"early={ev['predicted_in_advance']} during_only={ev['detected_only_during_seizure']} "
               f"missed={ev['missed']} mean_lead={ev['mean_lead_time_sec']:.0f}s "
