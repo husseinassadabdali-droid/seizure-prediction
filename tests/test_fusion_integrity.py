@@ -12,7 +12,7 @@ from fusion_classifier import FusionClassifier
 def test_branch_embedding_shapes_and_finiteness():
     torch.manual_seed(7)
     model=FusionModel().eval()
-    x=torch.randn(2,6,256)
+    x=torch.randn(2,6,1000)
     with torch.no_grad():
         e=model(x)
     assert e["tcn_embedding"].shape==(2,128)
