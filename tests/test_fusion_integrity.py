@@ -51,7 +51,7 @@ def test_frozen_branches_stay_eval_and_buffers_unchanged():
         assert not branch.training
         assert all(not p.requires_grad for p in branch.parameters())
     before={n:b.detach().clone() for n,b in backbone.named_buffers()}
-    x=torch.randn(2,6,256)
+    x=torch.randn(2,6,1000)
     model(x,"f2").sum().backward()
     after=dict(backbone.named_buffers())
     assert all(torch.equal(before[n],after[n]) for n in before)
@@ -93,3 +93,13 @@ def test_fusion_embeddings_match_standalone_branches():
                           atol=1e-6, rtol=1e-5)
     assert torch.allclose(fusion_embeddings["mlp_embedding"], mlp_expected,
                           atol=1e-6, rtol=1e-5)
+
+def test_f1_does_not_train_gate():
+    model = FusionClassifier()
+    model.train()
+    x = torch.randn(2, 6, 1000)
+    model(x, "f1").sum().backward()
+    assert all(p.grad is None for p in model.gate.parameters())
+    assert any(p.grad is not None for p in model.tcn_projection.parameters())
+    assert any(p.grad is not None for p in model.mlp_projection.parameters())
+    assert any(p.grad is not None for p in model.head.parameters())
