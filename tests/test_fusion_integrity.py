@@ -8,6 +8,11 @@ for p in (ROOT/"models", ROOT/"features", ROOT/"training"):
     sys.path.insert(0,str(p))
 from fusion_model import FusionModel
 from fusion_classifier import FusionClassifier
+from channel_attention import ChannelAttention
+from tcn_branch import TCNBranch
+from mlp_branch import MLPBranch
+from handcrafted_features import extract_features_from_window, N_FEATURES_PER_CHANNEL
+import numpy as np
 
 def test_branch_embedding_shapes_and_finiteness():
     torch.manual_seed(7)
@@ -60,3 +65,31 @@ def test_tcn_sanitation():
     y=FusionModel.sanitize_tcn_input(x)
     assert torch.isfinite(y).all()
     assert y.max()<=20 and y.min()>=-20
+
+
+def test_fusion_embeddings_match_standalone_branches():
+    """Fusion must preserve each pretrained branch's standalone forward path."""
+    torch.manual_seed(23)
+    fusion = FusionModel().eval()
+    attention = ChannelAttention(n_channels=6).eval()
+    tcn = TCNBranch(n_input_channels=6, output_dim=128).eval()
+    mlp = MLPBranch(n_input_features=6 * N_FEATURES_PER_CHANNEL, output_dim=64).eval()
+
+    attention.load_state_dict(fusion.attention.state_dict())
+    tcn.load_state_dict(fusion.tcn_branch.state_dict())
+    mlp.load_state_dict(fusion.mlp_branch.state_dict())
+
+    x = torch.randn(2, 6, 1000)
+    with torch.no_grad():
+        tcn_expected = tcn(attention(FusionModel.sanitize_tcn_input(x)))
+        feature_rows = np.stack([
+            extract_features_from_window(sample, fs=250)
+            for sample in x.numpy()
+        ]).astype(np.float32)
+        mlp_expected = mlp(torch.from_numpy(feature_rows))
+        fusion_embeddings = fusion(x)
+
+    assert torch.allclose(fusion_embeddings["tcn_embedding"], tcn_expected,
+                          atol=1e-6, rtol=1e-5)
+    assert torch.allclose(fusion_embeddings["mlp_embedding"], mlp_expected,
+                          atol=1e-6, rtol=1e-5)
