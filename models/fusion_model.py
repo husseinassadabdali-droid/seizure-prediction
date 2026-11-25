@@ -12,9 +12,15 @@ ROOT = Path(__file__).resolve().parent.parent
 for _p in (ROOT / "features", ROOT / "training"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
-from channel_attention import ChannelAttention
-from tcn_branch import TCNBranch
-from mlp_branch import MLPBranch
+try:  # Package imports (e.g. python -m models.fusion_model)
+    from .channel_attention import ChannelAttention
+    from .tcn_branch import TCNBranch
+    from .mlp_branch import MLPBranch
+except ImportError:  # Direct-script/test imports with models on sys.path
+    from channel_attention import ChannelAttention
+    from tcn_branch import TCNBranch
+    from mlp_branch import MLPBranch
+
 from handcrafted_features import extract_features_from_window, N_FEATURES_PER_CHANNEL
 
 N_CLASSES, FS, INPUT_CLIP = 3, 250, 20.0
