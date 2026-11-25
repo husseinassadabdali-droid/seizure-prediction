@@ -23,7 +23,7 @@ def test_branch_embedding_shapes_and_finiteness():
 def test_f1_f2_shapes_and_gate_range():
     torch.manual_seed(11)
     model=FusionClassifier().eval()
-    x=torch.randn(2,6,256)
+    x=torch.randn(2,6,1000)
     with torch.no_grad():
         f1=model(x,"f1",return_details=True)
         f2=model(x,"f2",return_details=True)
