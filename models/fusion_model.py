@@ -83,7 +83,7 @@ class FusionModel(nn.Module):
                        (attention_weights_path, "tcn_attention"))
         manifests = [validate_artifact_manifest(p, dataset_fingerprint, k)
                     for p, k in paths_kinds]
-        validate_matching_normalization_manifests(manifests[0], manifests[1])
+        validate_matching_normalization_manifests(*manifests)
         states = [torch.load(p, map_location=map_location, weights_only=True)
                   for p, _ in paths_kinds]
         self.tcn_branch.load_state_dict(states[0], strict=True)
