@@ -13,6 +13,7 @@ from tcn_branch import TCNBranch
 from mlp_branch import MLPBranch
 from handcrafted_features import extract_features_from_window, N_FEATURES_PER_CHANNEL
 import numpy as np
+import pytest
 
 def test_branch_embedding_shapes_and_finiteness():
     torch.manual_seed(7)
@@ -103,3 +104,61 @@ def test_f1_does_not_train_gate():
     assert any(p.grad is not None for p in model.tcn_projection.parameters())
     assert any(p.grad is not None for p in model.mlp_projection.parameters())
     assert any(p.grad is not None for p in model.head.parameters())
+
+def test_pretrained_checkpoint_loading_freezes_branches(tmp_path, monkeypatch):
+    """Exercise strict state loading without requiring real server checkpoints."""
+    import cache_provenance
+
+    source = FusionModel().eval()
+    paths = {
+        "tcn": tmp_path / "tcn.pt",
+        "mlp": tmp_path / "mlp.pt",
+        "attention": tmp_path / "attention.pt",
+    }
+    torch.save(source.tcn_branch.state_dict(), paths["tcn"])
+    torch.save(source.mlp_branch.state_dict(), paths["mlp"])
+    torch.save(source.attention.state_dict(), paths["attention"])
+
+    monkeypatch.setattr(
+        cache_provenance, "validate_artifact_manifest",
+        lambda _path, _fingerprint, _kind: {
+            "details": {"normalization_fingerprint": "synthetic-normalization"}
+        },
+    )
+    monkeypatch.setattr(
+        cache_provenance, "validate_matching_normalization_manifests",
+        lambda *manifests: "synthetic-normalization",
+    )
+
+    target = FusionModel()
+    target.load_pretrained_branches(
+        paths["tcn"], paths["mlp"], paths["attention"],
+        dataset_fingerprint="synthetic-dataset-fingerprint",
+    )
+    assert all(not p.requires_grad for module in (
+        target.tcn_branch, target.mlp_branch, target.attention
+    ) for p in module.parameters())
+    assert all(not module.training for module in (
+        target.tcn_branch, target.mlp_branch, target.attention
+    ))
+    for name, module in (
+        ("tcn", target.tcn_branch), ("mlp", target.mlp_branch),
+        ("attention", target.attention),
+    ):
+        assert all(torch.equal(a, b) for a, b in zip(
+            source_modules(source)[name].state_dict().values(),
+            module.state_dict().values()
+        ))
+
+
+def source_modules(model):
+    return {"tcn": model.tcn_branch, "mlp": model.mlp_branch,
+            "attention": model.attention}
+
+
+def test_normalization_provenance_mismatch_is_rejected():
+    from cache_provenance import validate_matching_normalization_manifests
+    first = {"details": {"normalization_fingerprint": "norm-a"}}
+    second = {"details": {"normalization_fingerprint": "norm-b"}}
+    with pytest.raises(ValueError, match="different normalization"):
+        validate_matching_normalization_manifests(first, second)
