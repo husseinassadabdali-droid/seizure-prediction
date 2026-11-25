@@ -1,7 +1,10 @@
 """F1 non-adaptive and F2 gated Fusion classifiers."""
 import torch
 import torch.nn as nn
-from fusion_model import FusionModel
+try:  # Package import
+    from .fusion_model import FusionModel
+except ImportError:  # Direct-script/test import
+    from fusion_model import FusionModel
 
 class FusionClassifier(nn.Module):
     def __init__(self, backbone=None, fusion_dropout=0.45, hidden_dim=128, n_classes=3):
